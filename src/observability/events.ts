@@ -4,7 +4,7 @@
  * Everything else in the monitor reads from here:
  *   - a bounded in-memory ring of recent events (config.monitor.maxEvents, default 100)
  *   - subscribe() for the SSE endpoint
- *   - counters (inspected / allowed / denied) from real, valid events only
+ *   - counters (inspected / allowed / denied / writesBlocked) from real, valid events only
  *   - redaction before anything is buffered, streamed or written to stderr
  *
  * stdout is reserved for the MCP protocol — never write to it.
@@ -27,6 +27,8 @@ export interface EventCounts {
   inspected: number;
   allowed: number;
   denied: number;
+  /** Allowed calls whose staged diff had at least one rejected change. Catch-up events are not calls. */
+  writesBlocked: number;
 }
 
 export type EventListener = (event: FirewallEvent) => void;
@@ -43,7 +45,7 @@ export interface EventBus {
   counts(): EventCounts;
   /** Called with each new redacted event. Returns an unsubscribe function. */
   subscribe(listener: EventListener): () => void;
-  /** Must never throw. Kept in its own ring (same size); does not touch counts(). */
+  /** Must never throw. Kept in its own ring (same size); only touches counts().writesBlocked. */
   publishFileChanges: PublishFileChangeEvent;
   /** Redacted file-change events currently in their ring, oldest first. */
   recentFileChanges(): FileChangeEvent[];
@@ -167,7 +169,7 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
   const listeners = new Set<EventListener>();
   const fileRing: FileChangeEvent[] = [];
   const fileListeners = new Set<FileChangeListener>();
-  const counts: EventCounts = { inspected: 0, allowed: 0, denied: 0 };
+  const counts: EventCounts = { inspected: 0, allowed: 0, denied: 0, writesBlocked: 0 };
 
   const safeLog = (line: string): void => {
     try {
@@ -230,6 +232,10 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
 
       fileRing.push(stored);
       if (fileRing.length > maxEvents) fileRing.splice(0, fileRing.length - maxEvents);
+      // One per call, not per file. "<late-writes>" and "<startup>" match no call, so they don't count.
+      if (stored.rejected > 0 && ring.some((e) => e.requestId === stored.requestId && e.decision === 'ALLOW')) {
+        counts.writesBlocked += 1;
+      }
 
       safeLog(JSON.stringify(stored));
       for (const listener of [...fileListeners]) {

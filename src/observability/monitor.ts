@@ -4,7 +4,8 @@
  *   GET /         → serves ./index.html (read-only UI)
  *   GET /events   → Server-Sent Events: the buffered recent events first, then live ones.
  *                   `firewall` frames carry FirewallEvents; `filechanges` frames carry
- *                   FileChangeEvents plus a ready-made `line` (paths and rule IDs, never contents).
+ *                   FileChangeEvents plus a ready-made `line` (paths and rule IDs, never contents);
+ *                   `counts` frames carry EventCounts after every live event of either kind.
  *   GET /health   → { status, protectedServers } from live upstream state
  *
  * Binds to config.host (127.0.0.1 only) and rejects requests whose Host header is
@@ -110,13 +111,18 @@ export async function startMonitor(config: MonitorConfig, options: MonitorOption
         writeFirewall(event);
         send(() => stream.writeSSE({ event: 'counts', data: JSON.stringify(bus.counts()) }));
       };
+      // A file-change event can move writesBlocked, so live ones are followed by counts too.
+      const sendFileChanges = (event: FileChangeEvent): void => {
+        writeFileChanges(event);
+        send(() => stream.writeSSE({ event: 'counts', data: JSON.stringify(bus.counts()) }));
+      };
 
       // Snapshot and subscribe in the same tick: publish is synchronous, so nothing
       // can land between them, and nothing is sent twice.
       const backlog = bus.recent();
       const fileBacklog = bus.recentFileChanges();
       const unsubscribe = bus.subscribe(sendEvent);
-      const unsubscribeFiles = bus.subscribeFileChanges(writeFileChanges);
+      const unsubscribeFiles = bus.subscribeFileChanges(sendFileChanges);
 
       send(() => stream.writeSSE({ event: 'counts', data: JSON.stringify(bus.counts()) }));
       // Call events first, so the page can attach each file-change line to its call's row.

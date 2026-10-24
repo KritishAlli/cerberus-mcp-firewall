@@ -23,6 +23,7 @@
         --deny: #b42318;
         --deny-bg: #fdecea;
         --warn: #9a6700;
+        --warn-bg: #fdf3d8;
       }
       @media (prefers-color-scheme: dark) {
         :root {
@@ -36,6 +37,7 @@
           --deny: #f2877c;
           --deny-bg: #3a1a17;
           --warn: #e3b341;
+          --warn-bg: #362a10;
         }
       }
       * { box-sizing: border-box; }
@@ -52,12 +54,14 @@
       #status { color: var(--muted); }
       #status.ok { color: var(--allow); }
       #status.bad { color: var(--warn); }
-      .counters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 20px 0; }
+      .counters { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0; }
+      @media (max-width: 560px) { .counters { grid-template-columns: repeat(2, 1fr); } }
       .counter { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
       .counter span { display: block; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
       .counter strong { font-size: 28px; font-variant-numeric: tabular-nums; }
       .counter.allowed strong { color: var(--allow); }
       .counter.denied strong { color: var(--deny); }
+      .counter.blocked strong { color: var(--warn); }
       .table-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
       table { width: 100%; border-collapse: collapse; }
       th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
@@ -65,14 +69,16 @@
       tr:last-child td { border-bottom: none; }
       td.time, td.tool { white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
       td.summary { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-word; }
-      .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+      .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
       .badge.ALLOW { color: var(--allow); background: var(--allow-bg); }
       .badge.DENY { color: var(--deny); background: var(--deny-bg); }
+      .badge.BLOCKED { color: var(--warn); background: var(--warn-bg); }
       .rule { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; }
       #empty { padding: 24px; text-align: center; color: var(--muted); }
       tr.files td { padding-top: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-word; }
       tr.files td.line { color: var(--allow); }
-      tr.files.has-rejected td.line { color: var(--deny); }
+      tr.files.has-rejected td.line { color: var(--warn); }
+      tr.files.orphan td { padding-top: 8px; }
       tr.files td.line::before { content: 'files '; color: var(--muted); }
       tr.call.has-files td { border-bottom: none; }
     </style>
@@ -88,6 +94,7 @@
         <div class="counter"><span>Inspected</span><strong id="inspected">–</strong></div>
         <div class="counter allowed"><span>Allowed</span><strong id="allowed">–</strong></div>
         <div class="counter denied"><span>Denied</span><strong id="denied">–</strong></div>
+        <div class="counter blocked"><span>Writes blocked</span><strong id="writesBlocked">–</strong></div>
       </section>
 
       <div class="table-wrap">
@@ -149,20 +156,37 @@
         return null;
       }
 
-      // Goes directly under its call's row. If that call has left the buffer, it stands alone.
+      // Goes directly under its call's row, and marks an ALLOW call whose writes were rejected.
+      // With no call row ("<late-writes>", "<startup>", or a call that left the buffer) it stands alone.
       function addFileChanges(event) {
         const tr = document.createElement('tr');
-        tr.className = 'files' + (event.rejected > 0 ? ' has-rejected' : '');
+        const blocked = event.rejected > 0;
+        tr.className = 'files' + (blocked ? ' has-rejected' : '');
         const call = findCallRow(event.requestId);
+        let line;
         if (call) {
           tr.appendChild(cell('', ''));
           tr.appendChild(cell('', ''));
+          line = cell('line', event.line);
+          line.colSpan = 3;
+          const badge = call.querySelector('.badge');
+          if (blocked && badge && badge.classList.contains('ALLOW')) {
+            badge.className = 'badge BLOCKED';
+            badge.textContent = 'ALLOW · WRITES BLOCKED';
+          }
         } else {
+          tr.classList.add('orphan');
           tr.appendChild(cell('time', new Date(event.timestamp).toLocaleTimeString()));
           tr.appendChild(cell('tool', event.serverId + '/' + event.toolName));
+          const decision = document.createElement('td');
+          const badge = document.createElement('span');
+          badge.className = 'badge ' + (blocked ? 'BLOCKED' : 'ALLOW');
+          badge.textContent = blocked ? 'WRITES BLOCKED' : 'WRITES APPLIED';
+          decision.appendChild(badge);
+          tr.appendChild(decision);
+          line = cell('line', event.line);
+          line.colSpan = 2;
         }
-        const line = cell('line', event.line);
-        line.colSpan = 3;
         tr.appendChild(line);
         if (call) {
           call.classList.add('has-files');
@@ -178,6 +202,7 @@
         document.getElementById('inspected').textContent = counts.inspected;
         document.getElementById('allowed').textContent = counts.allowed;
         document.getElementById('denied').textContent = counts.denied;
+        document.getElementById('writesBlocked').textContent = counts.writesBlocked;
       }
 
       // "Live" needs both: the event stream is open AND /health says a server is protected.
