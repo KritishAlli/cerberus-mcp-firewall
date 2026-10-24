@@ -1,6 +1,6 @@
 # Project status: proxy and enforcement (Aarav)
 
-Merged to `main` (PRs #2, #7). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
+Merged to `main` (PRs #2, #7, #9, #10). In progress on `aarav/staging`: `src/proxy/staging.ts` (not yet merged). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ## Done
 
@@ -9,7 +9,15 @@ Merged to `main` (PRs #2, #7). Rationale for each choice: [`docs/DECISIONS.md`](
 - **`src/proxy/server.ts`**: `startProxyServer(upstream, handler, { transport?, onClose? })` is a low-level `Server`. `tools/list` passes through unchanged, `tools/call` goes to the interceptor with the cancellation signal, and downstream `instructions` are not forwarded.
 - **`src/index.ts`**: passes the signal through, and shuts down cleanly on agent disconnect, stdin end, SIGINT or SIGTERM (2 s cap), closing the upstream, proxy and monitor. A downstream crash keeps the proxy up and fails closed. Kritish's PR #6 added one line wiring `/health` to live state: `monitor?.setProtectedServers(() => (upstream.connected ? 1 : 0))`. Reviewed: correct, and the optional chaining keeps enforcement independent of the monitor.
 - **`tests/fixtures/counting-server.ts`**: test-only stdio server (`echo`, `read_file`, `structured`, `tool_error`, `hang`, `crash`, `get_call_counts`) with an optional `--counts-file`.
-- **`tests/proxy.test.ts`**: 67 tests in tests/proxy.test.ts; full suite 115 passing (67 proxy, 10 contract, 14 security, 16 events, 8 monitor), 8 todo (all in `tests/e2e.test.ts`). Coverage:
+- **`src/proxy/staging.ts`** (staged writes, not yet wired into the interceptor): `createStagingArea({ projectRoot, stagingParent?, excludes?, extraExcludes?, maxFileBytes })` makes a `mkdtemp` staging dir (under `os.tmpdir()` by default, refused inside the project). The `StagingArea` it returns has:
+  - `sync()`: mirrors the project into staging minus excludes (`.git/`, `node_modules/`, `.env`, `.env.*` and any extras). Symlinks are recreated, never followed. Returns the pre-call staging manifest and the project manifest.
+  - `diff(before)`: rescans staging and returns `FileChange[]` (add / modify / delete / mode / symlink / special), sorted by path. `text` is set only for UTF-8 files without NUL of at most `maxFileBytes`.
+  - `apply(changes, decisions, projectAtSync)`: writes ALLOWed changes via temp file + rename. It skips a path with WRITE_CONFLICT if the project changed since sync. Symlink and special changes and excluded paths are never applied. A staged file that changed after `diff()` aborts the apply before anything is written.
+  - `revert(paths)`: restores those paths in staging from the project.
+
+  Also exported: `snapshot(root)`, `resolveInRoot(root, rel)` (the single path-safety check) and `StagingLock` (async mutex for the interceptor). Every error is thrown to the caller, with no paths or contents in messages. Node built-ins only. See [DECISIONS §10](docs/DECISIONS.md).
+- **`tests/staging.test.ts`**: 24 tests against real temp dirs: excludes, symlinks and hardlinks, text rules, path escapes, atomic apply, conflicts, defense in depth, revert, ordering and the lock.
+- **`tests/proxy.test.ts`**: 67 tests in tests/proxy.test.ts; full suite 157 passing (67 proxy, 28 contract, 14 security, 16 events, 8 monitor, 24 staging), 8 todo (all in `tests/e2e.test.ts`). Coverage:
   - unit tests (T01, T02, T06, T09, T11, fail-closed evaluator and publish, arg mutation, summary bounds, signal)
   - integration through the real stdio fixture (listing identical to direct, T01/T02 counts, structured results and tool errors, unknown tools, hang timeout, crash)
   - CLI smoke test of `src/index.ts`. With the real evaluator, its approved `fixture/echo` call now takes the forwarded (ALLOW) branch.
@@ -79,7 +87,7 @@ From `src/proxy/interceptor.ts`:
 
 - ~~`src/security/evaluator.ts` is the deny-all stub~~: Winston's real evaluator landed on `main` in PR #4 (`40ea8e4`). With the shipped policy it returns ALLOW / PROTECTED_PATH / DENIED_DESTINATION / DENIED_TOOL for the four demo calls, consistent with design §7.
 - ~~`demo/mock-server.ts` is a stub~~: landed in PR #3 (`6a7f51d`).
-- **Release gate (§10): all three commands pass** on this machine: `npm run typecheck`, `npm test` (115 passed, 8 todo) and `npm run demo` (DEMO PASSED, all 12 checks).
+- **Release gate (§10): all three commands pass** on this machine: `npm run typecheck`, `npm test` (157 passed, 8 todo) and `npm run demo` (DEMO PASSED, all 12 checks).
 - **Open policy issues for Winston** (found in a read-only review; no proxy change needed):
   - case-variant protected paths are allowed on macOS
   - relative-path traversal is not resolved
@@ -112,5 +120,8 @@ From `src/proxy/interceptor.ts`:
    - move "Claude Code setup (verified)" into the README and fix the stale status line
    - switch the demo's block detection to `_meta['mcp-firewall/decision']`
 5. ~~Shutdown hook for the monitor~~: already in place. `src/index.ts` closes it on shutdown, and port 3000 is freed after SIGINT.
-6. **Staged writes:** contract PR prepared on `contract/staged-writes` (`FileChange`, `ChangeDecision`, `StagingPolicy`, `FileChangeEvent`, `EvaluateFileChanges`, optional `policy.staging`, 7 staging rule IDs, and a reject-all stub in `src/proxy/stubs/`), pending team approval and merge. See [DECISIONS §9](docs/DECISIONS.md). Next: `src/proxy/staging.ts`.
+6. **Staged writes:**
+   - ~~Contract PR~~: merged (PR #10). See [DECISIONS §9](docs/DECISIONS.md).
+   - ~~`src/proxy/staging.ts`~~: built and tested on `aarav/staging`.
+   - **Next: interceptor integration.** Take the `StagingLock`, then sync, forward, and diff after every allowed call (including timeout and error). Then `evaluateFileChanges` (the stub until Winston's lands), apply/revert, the result note, `_meta['mcp-firewall/staged']` and the `FileChangeEvent`. Fail closed on any staging error.
 7. Optional, after acceptance tests: forward `list_changed`. Consider logging a clearer warning when the monitor port is taken, e.g. "events from this instance will not appear in the browser", and logging only the error code instead of the full `EADDRINUSE` object and stack.

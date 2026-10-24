@@ -104,3 +104,25 @@ Tradeoffs:
 - **Network tools don't work in sandbox mode.** The container runs with no network (`--network none`), so a server that needs to fetch or send data can't be sandboxed this way.
 - **Small projects only.** Copying and diffing the whole project on every call is slow and disk-heavy for large trees. `staging.maxFileBytes` and `staging.maxChangesPerCall` bound the work per call, not the project size.
 - `policy.staging` is optional in the schema so existing configs keep loading, but sandbox mode refuses to start without it. A missing section never means "allow all writes".
+
+## 10. Staging dir outside the project; revert from the real project
+
+`src/proxy/staging.ts` implements the copy, diff and apply half of §9.
+
+**Location.** The staging dir is a fresh `fs.mkdtemp` directory under `os.tmpdir()` by default (overridable). Creation fails if the parent is inside the protected project. A staging copy inside the project would show up in its own scans, could be picked up by the user's tools (git, editors, watchers) as project files, and would put server-written content one rename away from the real tree. Roots are resolved with `realpath` first (macOS `/var` → `/private/var`), so the containment check can't be fooled by a symlinked temp dir.
+
+**Revert from the real project, not from a backup.** A rejected path in staging is restored by copying it again from the real project, or by removing it if the project doesn't have it. Staging is meant to be "the project minus excludes" at the start of every call, and the project is the source of truth for that, so a separate pre-call backup would only be a second copy to keep in sync. If the user edited the file in the meantime, staging picks up their version, which is what the next call should see anyway. `sync()` uses the same rule for the whole tree, so a missed revert is also corrected at the next call.
+
+**The server is assumed hostile and still running.** It may change staging between `diff()` and `apply()`. So:
+
+- Walks use `lstat` and never descend into symlinks. Directory reads check that the path has no symlinked component.
+- Files are opened with `O_NOFOLLOW | O_NONBLOCK`, and the `dev`/`ino` of the open file must match the `lstat` result.
+- `apply()` re-reads every approved file and checks it against the size and SHA-256 that `diff()` recorded. Only then does it write anything, so the project only ever gets content the policy actually saw.
+- Writes into the project refuse paths whose parent is not a real directory.
+- Symlink and special changes are never applied, even if a decision says ALLOW.
+
+Residual risk: Node has no `openat`, so a symlink swapped into a *parent* directory between the check and the open is not fully excluded. Inside Docker (§9) the server only sees `/workspace`, and absolute link targets point into the container, not the host.
+
+**Conflicts.** Every write or delete re-reads the project path just before changing it and compares type, size, mode and SHA-256 to the manifest taken at `sync()`. On any difference it skips that path with WRITE_CONFLICT and leaves the user's edit alone. Writes go to a temp file in the same directory, then `rename`, so a reader never sees a half-written file. Permission bits other than the exec bit are kept from the existing file (0644 for new files), and setuid/setgid/sticky bits are never set.
+
+**Errors.** Nothing is swallowed. Every unexpected error is thrown to the caller, which must fail closed (apply nothing). Error messages carry no paths or contents. A file name that the contract's path schema can't represent (for example one containing a backslash) makes `diff()` throw rather than report it, and the next `sync()` removes it.
