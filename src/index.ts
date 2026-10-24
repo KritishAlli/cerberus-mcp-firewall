@@ -46,6 +46,7 @@ async function main(): Promise<void> {
       if (!shuttingDown) console.error('[firewall] downstream server closed; allowed calls will now fail closed');
     },
   });
+  monitor?.setProtectedServers(() => (upstream.connected ? 1 : 0));
   const handleToolCall = createInterceptor({
     serverId: config.server.id,
     policy: config.policy,
