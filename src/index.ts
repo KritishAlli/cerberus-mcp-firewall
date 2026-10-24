@@ -15,7 +15,7 @@ import { publishEvent } from './observability/events.js';
 import { startMonitor, type MonitorHandle } from './observability/monitor.js';
 import { createInterceptor } from './proxy/interceptor.js';
 import { startProxyServer, type ProxyServerHandle } from './proxy/server.js';
-import { connectUpstream } from './proxy/upstream.js';
+import { connectUpstream, localLaunch } from './proxy/upstream.js';
 import { evaluateToolCall } from './security/evaluator.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -41,7 +41,9 @@ async function main(): Promise<void> {
 
   let shuttingDown = false;
   // A downstream crash does not stop the proxy: later forwards fail closed, DENYs still BLOCK.
+  // Local launch from the existing `server` section. Docker mode comes from the config loader later.
   const upstream = await connectUpstream(config.server, {
+    launch: localLaunch(config.server),
     onClose: () => {
       if (!shuttingDown) console.error('[firewall] downstream server closed; allowed calls will now fail closed');
     },
