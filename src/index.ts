@@ -87,6 +87,7 @@ async function main(): Promise<void> {
       stagingDeps = {
         area: staging,
         lock: new StagingLock(),
+        evaluateFileChanges,
         policy: config.policy,
         terminalApproval: terminalApproval.changes,
         onFileChangeEvent: publishFileChangeEvent,

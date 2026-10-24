@@ -9,9 +9,9 @@
  * that reason instead.
  */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport, type StdioServerParameters } from '@modelcontextprotocol/client/stdio';
 import { InMemoryTransport, type CallToolResult } from '@modelcontextprotocol/server';
@@ -25,6 +25,9 @@ import {
   buildDockerArgs,
   connectUpstream,
   describeLaunch,
+  dockerSearchPath,
+  preflightDocker,
+  sweepOrphanedContainers,
   type DockerLaunch,
   type ExecFileFn,
   type UpstreamConnection,
@@ -35,6 +38,8 @@ const repoRoot = resolve(import.meta.dirname, '..');
 const countingServer = resolve(import.meta.dirname, 'fixtures/counting-server.ts');
 const server = { id: 'sandboxed', command: 'unused', args: [], timeoutMs: 10_000 };
 const NAME = 'mcpfw-0123456789ab';
+/** What `docker version --format '{{json .}}'` prints, trimmed to the fields preflight reads. */
+const DOCKER_VERSION_JSON = JSON.stringify({ Client: { Version: '29.9.2' }, Server: { Version: '29.9.2' } });
 
 let tmp: string;
 let workspace: string;
@@ -77,6 +82,7 @@ describe('upstream / buildDockerArgs', () => {
       '--user', '1000:1000',
       '--pids-limit', '64',
       '--memory', '256m',
+      '--memory-swap', '256m',
       '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
       '--mount', `type=bind,src=${workspace},dst=/workspace`,
       '--mount', `type=bind,src=${serverDir},dst=/server,readonly`,
@@ -90,12 +96,13 @@ describe('upstream / buildDockerArgs', () => {
     ]);
   });
 
-  it('defaults: host uid:gid, 128 pids, 512m, random name, and no /server mount without serverDir', () => {
+  it('defaults: host uid:gid, 128 pids, 512m with no swap, random name, and no /server mount without serverDir', () => {
     const args = buildDockerArgs(launch());
     const value = (flag: string) => args[args.indexOf(flag) + 1];
     expect(value('--user')).toBe(`${process.getuid!()}:${process.getgid!()}`);
     expect(value('--pids-limit')).toBe('128');
     expect(value('--memory')).toBe('512m');
+    expect(value('--memory-swap')).toBe('512m');
     expect(value('--name')).toMatch(/^mcpfw-[0-9a-f]{12}$/);
     expect(args.filter((a) => a === '--mount')).toHaveLength(1);
     expect(args.join(' ')).not.toContain('/server,');
@@ -124,7 +131,7 @@ describe('upstream / buildDockerArgs', () => {
     const args = buildDockerArgs(launch({ serverDir, env: { A: '--privileged' } }), { containerName: NAME });
     const beforeImage = args.slice(0, args.indexOf('mcp-sandbox:dev'));
     const ownFlags = new Set(['--rm', '-i', '--pull=never', '--name', '--network', '--read-only', '--cap-drop', '--security-opt',
-      '--user', '--pids-limit', '--memory', '--tmpfs', '--mount', '-e', '--label', '-w']);
+      '--user', '--pids-limit', '--memory', '--memory-swap', '--tmpfs', '--mount', '-e', '--label', '-w']);
     expect(beforeImage.filter((a) => a.startsWith('-') && !ownFlags.has(a))).toEqual([]);
   });
 
@@ -169,7 +176,7 @@ describe('upstream / buildDockerArgs', () => {
 });
 
 describe('upstream / docker preflight and lifecycle', () => {
-  const ok: ExecFileFn = async () => ({ stdout: '', stderr: '' });
+  const ok: ExecFileFn = async (_file, args) => ({ stdout: args[0] === 'version' ? DOCKER_VERSION_JSON : '', stderr: '' });
 
   it('refuses to start without Docker and never spawns', async () => {
     const execFile = vi.fn<ExecFileFn>(async () => {
@@ -180,7 +187,7 @@ describe('upstream / docker preflight and lifecycle', () => {
     expect(err).toBeInstanceOf(SandboxUnavailableError);
     expect((err as Error).message).toBe('sandbox mode requires Docker, and docker CLI not found; refusing to start');
     expect(execFile).toHaveBeenCalledTimes(1);
-    expect(execFile.mock.calls[0]?.slice(0, 2)).toEqual(['docker', ['version', '--format', '{{.Server.Version}}']]);
+    expect(execFile.mock.calls[0]?.slice(0, 2)).toEqual(['docker', ['version', '--format', '{{json .}}']]);
     expect(createTransport).not.toHaveBeenCalled();
   });
 
@@ -204,7 +211,7 @@ describe('upstream / docker preflight and lifecycle', () => {
   it('refuses to start when the image is missing, and never pulls', async () => {
     const execFile = vi.fn<ExecFileFn>(async (_file, args) => {
       if (args[0] === 'image') throw new Error('No such image');
-      return { stdout: '27.0.0', stderr: '' };
+      return { stdout: DOCKER_VERSION_JSON, stderr: '' };
     });
     const createTransport = vi.fn();
     const err = await connectUpstream(server, { launch: launch(), execFile, createTransport }).catch((e: unknown) => e);
@@ -212,6 +219,111 @@ describe('upstream / docker preflight and lifecycle', () => {
     expect((err as Error).message).toMatch(/"mcp-sandbox:dev" was not found locally; build it first/);
     expect(execFile.mock.calls.map((c) => c[1][0])).toEqual(['version', 'image']);
     expect(createTransport).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['empty output', ''],
+    ['non-JSON output', 'Saved file tree to doc-filelist.js\n'],
+    ['JSON without Server', DOCKER_VERSION_JSON.replace('"Server"', '"Other"')],
+    ['a null Server', '{"Client":{"Version":"29.9.2"},"Server":null}'],
+    ['an empty Server.Version', '{"Client":{"Version":"29.9.2"},"Server":{"Version":" "}}'],
+    ['a non-string Server.Version', '{"Server":{"Version":29}}'],
+  ])('refuses to start when `docker version` exits 0 with %s, and never spawns', async (_case, stdout) => {
+    const execFile = vi.fn<ExecFileFn>(async () => ({ stdout, stderr: '' }));
+    const createTransport = vi.fn();
+    const err = await connectUpstream(server, { launch: launch(), execFile, createTransport }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxUnavailableError);
+    expect((err as Error).message).toMatch(/the docker on PATH is not the Docker CLI/);
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(createTransport).not.toHaveBeenCalled();
+  });
+
+  it('dockerSearchPath drops node_modules/.bin and relative entries, keeping the rest in order', () => {
+    const path = [
+      '/repo/node_modules/.bin',
+      '/usr/local/bin',
+      '/repo/sub/node_modules/.bin/',
+      '',
+      '.',
+      'node_modules/.bin',
+      '/opt/node_modules/.bin-not/tools',
+      '/usr/bin',
+    ].join(delimiter);
+    expect(dockerSearchPath(path)).toBe(['/usr/local/bin', '/opt/node_modules/.bin-not/tools', '/usr/bin'].join(delimiter));
+    expect(dockerSearchPath(undefined)).toBe('');
+  });
+
+  it('every docker command (preflight, sweep, run, rm) gets a PATH without node_modules/.bin', async () => {
+    const shadow = join(tmp, 'node_modules', '.bin');
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${shadow}${delimiter}${originalPath ?? ''}`;
+    const paths: { command: string; path: string | undefined }[] = [];
+    try {
+      const upstream = await connectUpstream(server, {
+        launch: launch(),
+        execFile: async (_file, args, options) => {
+          paths.push({ command: args[0]!, path: options.env.PATH });
+          return { stdout: args[0] === 'version' ? DOCKER_VERSION_JSON : '', stderr: '' };
+        },
+        createTransport: (p) => {
+          paths.push({ command: 'run', path: p.env?.PATH });
+          return new StdioClientTransport({ command: process.execPath, args: ['--import', 'tsx', countingServer], cwd: repoRoot, stderr: 'pipe' });
+        },
+      });
+      await upstream.close();
+    } finally {
+      process.env.PATH = originalPath;
+    }
+    expect(paths.map((p) => p.command)).toEqual(['version', 'image', 'ps', 'run', 'rm']);
+    for (const { path } of paths) {
+      expect(path).toBeTruthy();
+      expect(path!.split(delimiter)).not.toContain(shadow);
+      expect(path).not.toMatch(/node_modules[\\/]\.bin/);
+    }
+  });
+
+  // Real child processes: a script named docker that records every invocation.
+  describe.skipIf(process.platform === 'win32')('with a fake docker executable on PATH', () => {
+    async function fakeDocker(dir: string, stdout: string): Promise<{ invocations: () => Promise<string[]> }> {
+      await mkdir(dir, { recursive: true });
+      const log = join(tmp, `fake-docker-${Math.random().toString(16).slice(2)}.log`);
+      const script = join(dir, 'docker');
+      await writeFile(script, `#!/bin/sh\necho "$*" >> '${log}'\nprintf '%s' '${stdout}'\nexit 0\n`);
+      await chmod(script, 0o755);
+      return { invocations: async () => (await readFile(log, 'utf8').catch(() => '')).split('\n').filter(Boolean) };
+    }
+    let originalPath: string | undefined;
+    beforeEach(() => {
+      originalPath = process.env.PATH;
+    });
+    afterEach(() => {
+      process.env.PATH = originalPath;
+    });
+
+    it('a docker in a node_modules/.bin on PATH is never run, even one that prints valid version JSON', async () => {
+      const shadow = join(tmp, 'node_modules', '.bin');
+      const fake = await fakeDocker(shadow, DOCKER_VERSION_JSON);
+      process.env.PATH = `${shadow}${delimiter}${originalPath ?? ''}`;
+      // Real execFile: whatever docker is found on the filtered PATH (the real CLI, or none) answers.
+      await preflightDocker(`mcpfw-test-absent-${process.pid}:never`).catch(() => {});
+      // isAlive: never remove a real container from a unit test.
+      await sweepOrphanedContainers({ log: () => {}, isAlive: () => true });
+      expect(await fake.invocations()).toEqual([]);
+    });
+
+    it('a docker that exits 0 with junk output fails preflight and never starts a container', async () => {
+      const dir = join(tmp, 'fake-bin');
+      const fake = await fakeDocker(dir, 'Saved file tree to doc-filelist.js');
+      process.env.PATH = `${dir}${delimiter}${originalPath ?? ''}`;
+      const createTransport = vi.fn();
+      const err = await connectUpstream(server, { launch: launch(), createTransport }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(SandboxUnavailableError);
+      expect((err as Error).message).toBe(
+        'sandbox mode requires Docker, and the docker on PATH is not the Docker CLI (`docker version` did not report a server version); refusing to start',
+      );
+      expect(createTransport).not.toHaveBeenCalled();
+      expect(await fake.invocations()).toEqual(['version --format {{json .}}']);
+    });
   });
 
   it('rejects an invalid launch before calling docker at all', async () => {
@@ -246,7 +358,7 @@ describe('upstream / docker preflight and lifecycle', () => {
   it('reports launch info and removes the container on close, ignoring "no such container"', async () => {
     const execFile = vi.fn<ExecFileFn>(async (_file, args) => {
       if (args[0] === 'rm') throw Object.assign(new Error('rm failed'), { stderr: 'Error: No such container: x' });
-      return { stdout: '', stderr: '' };
+      return { stdout: args[0] === 'version' ? DOCKER_VERSION_JSON : '', stderr: '' };
     });
     const sigintListeners = process.listenerCount('SIGINT');
     const stderr = vi.spyOn(process.stderr, 'write');
@@ -397,7 +509,7 @@ describe.skipIf(dockerSkipReason !== undefined && !requireDocker)('upstream / do
       // Preflight and the sweep are faked to pass; `docker run` itself is real.
       const err = await connectUpstream(server, {
         launch: { mode: 'docker', image, command: 'node', workspaceDir: dir },
-        execFile: async () => ({ stdout: '', stderr: '' }),
+        execFile: async (_file, args) => ({ stdout: args[0] === 'version' ? DOCKER_VERSION_JSON : '', stderr: '' }),
       }).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(UpstreamUnavailableError);
       const lines = stderr.mock.calls.map(([line]) => String(line)).join('');

@@ -58,7 +58,7 @@ export const REJECTED_CHANGES_PREFIX = 'MCP Firewall: changes blocked.';
 /** Put before the server's first text block in such a result, so its own "success" text can't stand alone. */
 export const SERVER_OUTPUT_PREFIX = 'Server output (from the sandboxed copy; see firewall note above):';
 
-/** Used when no evaluateFileChanges is injected (src/index.ts injects none). */
+/** Fallback when StagingDeps has no evaluateFileChanges (tests); src/index.ts injects it explicitly. */
 export const defaultEvaluateFileChanges: EvaluateFileChanges = evaluateFileChanges;
 
 const LATE_TOOL_NAME = '<late-writes>';
@@ -78,10 +78,13 @@ export interface StagingDeps {
   area: StagingAreaLike;
   /** Held from the catch-up diff to the end of post-call processing. */
   lock: StagingLock;
-  /** Default: defaultEvaluateFileChanges (reject-all until Winston's lands). */
+  /** Default: defaultEvaluateFileChanges (src/security/changes.ts). */
   evaluateFileChanges?: EvaluateFileChanges;
   policy: FirewallPolicy;
-  /** Must not throw; if it does, the error is logged and the result is unaffected. */
+  /**
+   * Must not throw; if it does, the error is logged and the result is unaffected. A
+   * returned thenable is observed, not awaited: its rejection is logged the same way.
+   */
   onFileChangeEvent?: (event: FileChangeEvent) => void;
   /** One-time approval for safely applicable sandbox changes; technical hard-denials remain enforced. */
   terminalApproval?: TerminalApproval['changes'];
@@ -407,10 +410,30 @@ function emitFileChangeEvent(
     log(`[firewall] request ${e.requestId} file change event failed validation; not published`);
     return;
   }
+  const failed = (err: unknown): void => {
+    try {
+      log(`[firewall] request ${e.requestId} file change event callback failed: ${describeError(err)}`);
+    } catch {
+      // Diagnostics must not affect the result either.
+    }
+  };
+  let returned: unknown;
   try {
-    staging.onFileChangeEvent?.(parsed.data);
+    returned = staging.onFileChangeEvent?.(parsed.data);
   } catch (err) {
-    log(`[firewall] request ${e.requestId} file change event callback failed: ${describeError(err)}`);
+    failed(err);
+    return;
+  }
+  // Typed `=> void`, which an async function also satisfies: observe a returned thenable
+  // like the interceptor's publish, so its rejection is logged, never left unhandled.
+  try {
+    if ((typeof returned === 'object' && returned !== null) || typeof returned === 'function') {
+      if (typeof (returned as { then?: unknown }).then === 'function') {
+        Promise.resolve(returned as PromiseLike<unknown>).then(undefined, failed);
+      }
+    }
+  } catch (err) {
+    failed(err);
   }
 }
 
