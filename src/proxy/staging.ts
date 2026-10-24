@@ -552,7 +552,8 @@ async function readOwner(dir: string): Promise<StagingOwner | undefined> {
 }
 
 /** Only ESRCH means gone; EPERM means it exists under another user. */
-function isProcessAlive(pid: number): boolean {
+/** False only when the pid certainly does not exist (ESRCH). EPERM and anything else count as alive. */
+export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;

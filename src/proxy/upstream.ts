@@ -7,7 +7,9 @@
  *             "Sandbox"): no network, read-only root, all capabilities dropped, only
  *             the staging dir (rw) and optionally the server code (ro) mounted. Docker
  *             must be running and the image must exist locally, or this refuses to
- *             start. There is never a fallback to local mode.
+ *             start. There is never a fallback to local mode. Containers are labeled
+ *             with the firewall's pid and host; before launching, containers left by
+ *             a dead firewall on this host are removed (sweepOrphanedContainers).
  *
  * Either way the child gets a safe default environment (not our full env, which
  * may hold real credentials) plus only explicitly configured variables, its
@@ -21,6 +23,7 @@
 import { execFile as execFileCallback, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { realpathSync, statSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { isAbsolute } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Readable } from 'node:stream';
@@ -30,6 +33,7 @@ import { getDefaultEnvironment, StdioClientTransport, type StdioServerParameters
 import type { CallToolResult, Tool } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { DownstreamServerConfig } from '../shared/contracts.js';
+import { isProcessAlive } from './staging.js';
 
 /** Cap on tools/list pages, against a server whose nextCursor never converges. */
 const MAX_LIST_PAGES = 20;
@@ -38,6 +42,18 @@ const MAX_STDERR_LINE = 2_000;
 const DOCKER_CLI_TIMEOUT_MS = 5_000;
 /** Docker CLI settings passed through to the docker client itself (never into the container). */
 const DOCKER_CLI_ENV_VARS = ['DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'DOCKER_CERT_PATH', 'DOCKER_TLS_VERIFY'];
+
+/** Labels on every sandbox container. sweepOrphanedContainers reads them; nothing else does. */
+export const CONTAINER_LABELS = {
+  /** Always "1": marks a container this firewall started. */
+  owner: 'mcp-firewall',
+  /** Pid of the firewall process that started it. */
+  pid: 'mcp-firewall.pid',
+  /** Host it was started from, so a shared or remote Docker daemon never compares another machine's pids. */
+  host: 'mcp-firewall.host',
+  /** Staging dir mounted at /workspace (for diagnosis only). */
+  staging: 'mcp-firewall.staging',
+} as const;
 
 export class UpstreamUnavailableError extends Error {
   override name = 'UpstreamUnavailableError';
@@ -178,11 +194,20 @@ export function newContainerName(): string {
  * The `docker` argv for a docker launch, in a fixed order. No shell is ever
  * involved. Throws LaunchConfigError for invalid input, including mount paths
  * that do not exist or resolve to something containing a comma or newline.
+ * `--pull=never`: preflight checked the image, and an image removed since then
+ * must fail the launch, never be pulled. `ownerPid` and `host` default to this
+ * process and this machine (test seams).
  */
-export function buildDockerArgs(launch: DockerLaunch, options: { containerName?: string } = {}): string[] {
+export function buildDockerArgs(
+  launch: DockerLaunch,
+  options: { containerName?: string; ownerPid?: number; host?: string } = {},
+): string[] {
   const l = parseLaunch(DockerLaunchSchema, launch);
   const name = options.containerName ?? newContainerName();
   if (!/^mcpfw-[0-9a-f]+$/.test(name)) throw new LaunchConfigError('invalid container name');
+  const ownerPid = options.ownerPid ?? process.pid;
+  if (!Number.isInteger(ownerPid) || ownerPid < 1) throw new LaunchConfigError('invalid owner pid');
+  const workspace = mountSource(l.workspaceDir, 'workspaceDir');
 
   // [flag, value] pairs before the image. Every value is checked not to look like a flag.
   const flags: [string, string][] = [
@@ -194,13 +219,19 @@ export function buildDockerArgs(launch: DockerLaunch, options: { containerName?:
     ['--pids-limit', String(l.pidsLimit ?? 128)],
     ['--memory', l.memory ?? '512m'],
     ['--tmpfs', '/tmp:rw,noexec,nosuid,size=64m'],
-    ['--mount', `type=bind,src=${mountSource(l.workspaceDir, 'workspaceDir')},dst=/workspace`],
+    ['--mount', `type=bind,src=${workspace},dst=/workspace`],
   ];
   if (l.serverDir !== undefined) {
     flags.push(['--mount', `type=bind,src=${mountSource(l.serverDir, 'serverDir')},dst=/server,readonly`]);
   }
   for (const [key, value] of Object.entries(l.env ?? {})) flags.push(['-e', `${key}=${value}`]);
-  flags.push(['-w', '/workspace']);
+  flags.push(
+    ['--label', `${CONTAINER_LABELS.owner}=1`],
+    ['--label', `${CONTAINER_LABELS.pid}=${ownerPid}`],
+    ['--label', `${CONTAINER_LABELS.host}=${labelHost(options.host)}`],
+    ['--label', `${CONTAINER_LABELS.staging}=${workspace}`],
+    ['-w', '/workspace'],
+  );
 
   for (const [, value] of flags) {
     if (value.startsWith('-')) throw new LaunchConfigError('a docker flag value must not start with "-"');
@@ -210,6 +241,7 @@ export function buildDockerArgs(launch: DockerLaunch, options: { containerName?:
     'run',
     '--rm',
     '-i',
+    '--pull=never',
     ...nameFlag!,
     ...network!,
     // --read-only takes no value, so it sits between the pairs.
@@ -219,6 +251,11 @@ export function buildDockerArgs(launch: DockerLaunch, options: { containerName?:
     l.command,
     ...l.args,
   ];
+}
+
+/** The host label value: this machine's name, limited to [A-Za-z0-9._-]. */
+function labelHost(host: string = hostname()): string {
+  return host.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 253) || 'unknown';
 }
 
 function defaultUser(): string {
@@ -279,6 +316,62 @@ export async function preflightDocker(image: string, execFile: ExecFileFn = defa
       `sandbox image "${image}" was not found locally; build it first (images are never pulled automatically); refusing to start`,
     );
   }
+}
+
+export interface SweepContainersOptions {
+  execFile?: ExecFileFn;
+  /** Default: process.kill(pid, 0); only ESRCH counts as dead. */
+  isAlive?: (pid: number) => boolean;
+  /** Default: this machine (see buildDockerArgs). */
+  host?: string;
+  /** Diagnostics sink (one line, no trailing newline). Defaults to stderr. */
+  log?: (line: string) => void;
+}
+
+/**
+ * Removes sandbox containers left behind by a firewall that died without cleanup
+ * (SIGKILL, OOM, power loss) whose server kept running after stdin EOF. A container
+ * is removed only if it carries our owner label, this host's label, and a recorded
+ * pid that no longer exists. A container whose firewall is alive (another session's,
+ * a teammate's) is never touched, nor is one without our labels (started by an older
+ * version). Never throws: failures are logged and startup continues.
+ */
+export async function sweepOrphanedContainers(options: SweepContainersOptions = {}): Promise<string[]> {
+  const execFile = options.execFile ?? defaultExecFile;
+  const isAlive = options.isAlive ?? isProcessAlive;
+  const log = options.log ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const cli = { timeout: DOCKER_CLI_TIMEOUT_MS, env: dockerCliEnv() };
+  const host = labelHost(options.host);
+  const removed: string[] = [];
+  let listing: string;
+  try {
+    const format = `{{.Names}}\t{{.Label "${CONTAINER_LABELS.pid}"}}\t{{.Label "${CONTAINER_LABELS.host}"}}`;
+    ({ stdout: listing } = await execFile(
+      'docker',
+      ['ps', '-a', '--filter', `label=${CONTAINER_LABELS.owner}=1`, '--format', format],
+      cli,
+    ));
+  } catch (err) {
+    log(`[firewall] container sweep skipped: could not list containers (${errorCode(err)})`);
+    return removed;
+  }
+  for (const line of listing.split('\n')) {
+    const [name, pidText, labelledHost] = line.trim().split('\t');
+    if (!name || !/^mcpfw-[0-9a-f]+$/.test(name) || labelledHost !== host) continue;
+    if (!/^[1-9][0-9]{0,9}$/.test(pidText ?? '')) continue;
+    const pid = Number(pidText);
+    if (pid === process.pid || isAlive(pid)) continue;
+    try {
+      await execFile('docker', ['rm', '-f', name], cli);
+      removed.push(name);
+    } catch (err) {
+      log(`[firewall] could not remove orphaned container ${name} (${errorCode(err)})`);
+    }
+  }
+  if (removed.length > 0) {
+    log(`[firewall] removed ${removed.length} orphaned sandbox container(s) of dead firewalls: ${removed.join(', ')}`);
+  }
+  return removed;
 }
 
 /**
@@ -374,6 +467,8 @@ export async function connectUpstream(
     containerName = newContainerName();
     const args = buildDockerArgs(launch, { containerName });
     await preflightDocker(launch.image, execFile);
+    // Before launching ours. Never throws, so a failed sweep can neither block startup nor change the launch.
+    await sweepOrphanedContainers({ execFile });
     params = { command: 'docker', args, env: dockerCliEnv(), stderr: 'pipe' };
   }
   const info = describeLaunch(launch, containerName);
