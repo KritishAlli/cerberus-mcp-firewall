@@ -1,0 +1,10 @@
+# Dependencies: install with `npm ci` (package-lock.json is committed)
+node_modules/
+
+# Logs and tool output
+npm-debug.log*
+*.tsbuildinfo
+coverage/
+
+# OS files
+.DS_Store
