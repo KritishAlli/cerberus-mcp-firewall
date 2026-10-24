@@ -77,6 +77,7 @@ describe('upstream / buildDockerArgs', () => {
       '--user', '1000:1000',
       '--pids-limit', '64',
       '--memory', '256m',
+      '--memory-swap', '256m',
       '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
       '--mount', `type=bind,src=${workspace},dst=/workspace`,
       '--mount', `type=bind,src=${serverDir},dst=/server,readonly`,
@@ -90,12 +91,13 @@ describe('upstream / buildDockerArgs', () => {
     ]);
   });
 
-  it('defaults: host uid:gid, 128 pids, 512m, random name, and no /server mount without serverDir', () => {
+  it('defaults: host uid:gid, 128 pids, 512m with no swap, random name, and no /server mount without serverDir', () => {
     const args = buildDockerArgs(launch());
     const value = (flag: string) => args[args.indexOf(flag) + 1];
     expect(value('--user')).toBe(`${process.getuid!()}:${process.getgid!()}`);
     expect(value('--pids-limit')).toBe('128');
     expect(value('--memory')).toBe('512m');
+    expect(value('--memory-swap')).toBe('512m');
     expect(value('--name')).toMatch(/^mcpfw-[0-9a-f]{12}$/);
     expect(args.filter((a) => a === '--mount')).toHaveLength(1);
     expect(args.join(' ')).not.toContain('/server,');
@@ -124,7 +126,7 @@ describe('upstream / buildDockerArgs', () => {
     const args = buildDockerArgs(launch({ serverDir, env: { A: '--privileged' } }), { containerName: NAME });
     const beforeImage = args.slice(0, args.indexOf('mcp-sandbox:dev'));
     const ownFlags = new Set(['--rm', '-i', '--pull=never', '--name', '--network', '--read-only', '--cap-drop', '--security-opt',
-      '--user', '--pids-limit', '--memory', '--tmpfs', '--mount', '-e', '--label', '-w']);
+      '--user', '--pids-limit', '--memory', '--memory-swap', '--tmpfs', '--mount', '-e', '--label', '-w']);
     expect(beforeImage.filter((a) => a.startsWith('-') && !ownFlags.has(a))).toEqual([]);
   });
 

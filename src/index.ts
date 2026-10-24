@@ -18,6 +18,7 @@ import { startProxyServer, type ProxyServerHandle } from './proxy/server.js';
 import { initStaging, type StagingDeps } from './proxy/staged-call.js';
 import { createStagingArea, StagingLock, sweepStaleStagingDirs, type StagingArea, type SyncResult } from './proxy/staging.js';
 import { connectUpstream, type UpstreamConnection } from './proxy/upstream.js';
+import { evaluateFileChanges } from './security/changes.js';
 import { evaluateToolCall } from './security/evaluator.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -76,6 +77,7 @@ async function main(): Promise<void> {
       stagingDeps = {
         area: staging,
         lock: new StagingLock(),
+        evaluateFileChanges,
         policy: config.policy,
         onFileChangeEvent: publishFileChangeEvent,
       };

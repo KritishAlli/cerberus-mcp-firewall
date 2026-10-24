@@ -1,20 +1,20 @@
 # Project status: proxy and enforcement (Aarav)
 
-Merged to `main` (PRs #2, #7, #9, #10, #11, #12, #16). In progress on `aarav/docker-fixes`: fixes from the first Docker run (not yet merged). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
+Merged to `main` (PRs #2, #7, #9, #10, #11, #12, #16, #17, #23). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ## Cerberus 4.1 audit (2026-10-24, at `b0aaa7d`)
 
-Full report: [`docs/cerberus-proxy-audit.md`](docs/cerberus-proxy-audit.md). The audit changed no behavior; the follow-up the same day fixed 1c, 1e and 1f and restored the deleted suites (below). New: `tests/proxy-audit.test.ts` and `tests/fixtures/audit-stdio-server.mjs`.
+Full report: [`docs/cerberus-proxy-audit.md`](docs/cerberus-proxy-audit.md). The audit changed no behavior; the follow-up the same day fixed 1c, 1e and 1f and restored the deleted suites (below). `aarav/wire-change-evaluator` closed 1g and the remaining 1c/1e/1f items. New: `tests/proxy-audit.test.ts` and `tests/fixtures/audit-stdio-server.mjs`.
 
 | Item | Verdict |
 | --- | --- |
 | 1a No forward on DENY | Pass |
 | 1b Fail closed | Pass (an apply failure can leave earlier *approved* changes applied, named in the result) |
-| 1c Publish can't change the decision | Pass. **Fixed:** a promise returned by `publish` is observed; its rejection is logged (class and code only) and never unhandled. |
+| 1c Publish can't change the decision | Pass. **Fixed:** a promise returned by `publish`, and now one returned by `onFileChangeEvent`, is observed; its rejection is logged (class and code only), never unhandled, and never changes the result. |
 | 1d Docker preflight, no local fallback | Pass |
-| 1e Docker flags | Pass. **Fixed:** `docker run --pull=never`. Still open: swap is 2× memory. |
-| 1f Container cleanup | Pass. **Fixed:** containers are labeled (`mcp-firewall=1`, `.pid`, `.host`, `.staging`), and before each launch `sweepOrphanedContainers` removes only those of dead firewalls on this host. Live instances' and unlabeled containers are never touched; the sweep never throws or blocks startup. Still open: with a server that ignores stdin EOF, graceful shutdown hits the 2 s cap before `staging.dispose()` (the dir is swept on the next start). |
-| 1g Staged-call integration | Mechanism passes (lock, diff after error/timeout, apply/revert, WRITE_CONFLICT). **The runtime uses the reject-all stub:** `src/security` has no `evaluateFileChanges` and `src/index.ts` injects none, so `policy.staging` enforces nothing. |
+| 1e Docker flags | Pass. **Fixed:** `docker run --pull=never`, and `--memory-swap` equal to `--memory` (no swap; verified `MemorySwap == Memory` on a live container). |
+| 1f Container cleanup | Pass. **Fixed:** containers are labeled (`mcp-firewall=1`, `.pid`, `.host`, `.staging`), and before each launch `sweepOrphanedContainers` removes only those of dead firewalls on this host. Live instances' and unlabeled containers are never touched; the sweep never throws or blocks startup. **Fixed:** `close()` runs `docker rm -f` before closing the MCP client, so a server that ignores stdin EOF can't hold shutdown to the 2 s cap before `staging.dispose()`. |
+| 1g Staged-call integration | Pass. **Fixed:** `src/index.ts` injects Winston's `evaluateFileChanges` (`src/security/changes.ts`), so `policy.staging` is enforced. `GAP 1g` is now a plain test: an allowed `src/` write lands in the project, a `.git/hooks` write is DENY / `PERSISTENCE_PATH`. |
 
 **Test suite:** `fe9db11` (Winston's branch) deleted the previous suite (2,653 lines). Aarav's suites are restored from `fa72e8e`, the newest copies on main. The `fe9db11^` copies were older, from before PRs #11–#18.
 
@@ -30,10 +30,16 @@ Full report: [`docs/cerberus-proxy-audit.md`](docs/cerberus-proxy-audit.md). The
 - **Four stale assertions updated** to the current behavior, just as strictly: the counts now include `writesBlocked` (`f4dd9a2`); the rejection note comes first and `isError` is set (`d11339a`, two tests); `/health` includes `instance` (`76c88f1`).
 - **Not restored:** the monitor, events, contracts, security and e2e suites are other owners'. The counts further down describe the pre-`fe9db11` suite and are historical.
 
-Now:
+Now (on `aarav/wire-change-evaluator`):
 - `npm run typecheck`: passes.
-- `npm test`: 5 files, 191 passed, 1 expected-fail (`GAP 1g`).
+- `npm test`: 11 files, 261 passed, no expected-fails left.
 - `npm run test:docker`: 36 passed with Docker 29.9.2. That includes real-container tests for `--pull=never` and the orphan sweep: SIGKILL one firewall, start a new one, the orphan is removed and a live instance's container survives.
+- `npm run demo` (mock mode): passes.
+- **Sandbox mode, by hand** (`src/index.ts --config config/sandbox.yaml`, real container, MCP client calling `write_file`): an edit to `src/greet.js` was ALLOWed and reached `demo/project`; `.husky/pre-commit` and a `package.json` `postinstall` were DENY / `PERSISTENCE_PATH` and never reached the project; a `.git/hooks/pre-commit` write never got that far (see below). `demo/project` was reverted afterward. `npm run demo` itself only drives the mock server.
+
+**Found in the sandbox run** (not changed here):
+- **Winston:** the tool-call evaluator scans `write_file`'s `content` for path-like tokens. Any content with a `//` comment or an absolute path (`see /etc/hosts`) is `PATH_NOT_ALLOWED`, so most real source edits are blocked in sandbox mode before staging sees them.
+- **Staging:** the server can't create a file in a new directory. `write_file` doesn't create parents, and an empty directory made by `create_directory` is removed by the next pre-call sync (and anything under `.git/` by `removeExcluded`). Safe, but it means a new `src/sub/` file is impossible too. Needs a decision on whether directory adds should be staged.
 
 **Also found:**
 - Session taint is never wired: `index.ts` passes no `getSession`, so `SESSION_TAINTED` can't fire.
@@ -45,7 +51,7 @@ Now:
 ## Done
 
 - **`src/proxy/interceptor.ts`**: `createInterceptor(deps)` does validate → clone + deep-freeze → evaluate (schema-checked, fail closed) → publish exactly one event → forward only on ALLOW. It returns a recognizable BLOCKED tool error on DENY and a fixed-message DOWNSTREAM ERROR when the downstream fails.
-  - **Staged writes** (on `aarav/interceptor-staging`): the optional `staging` dep `{ area, lock, evaluateFileChanges?, policy, onFileChangeEvent? }` sends every ALLOWed call through `runStagedCall` in the new **`src/proxy/staged-call.ts`**. Without it, behavior is unchanged and every earlier test passes as before.
+  - **Staged writes**: the optional `staging` dep `{ area, lock, evaluateFileChanges?, policy, onFileChangeEvent? }` sends every ALLOWed call through `runStagedCall` in the new **`src/proxy/staged-call.ts`**. Without it, behavior is unchanged and every earlier test passes as before.
   - Per call, under the `StagingLock`: a catch-up diff for late writes (reported as `<late-writes>`, request `<id>:late`), then sync, forward, and a diff that runs even after an error or timeout. Then `evaluateFileChanges` (output validated; if it throws or the output is malformed, every change is DENY / `EVALUATION_ERROR`), apply, revert of rejected changes, and a sync that sets the next baseline.
   - The result keeps the downstream content and gets `_meta['mcp-firewall/staged'] = { applied, rejected, changes, truncated? }`. `changes` is capped at 100 and the totals stay exact. If anything was rejected (since `d11339a`), the result is `isError: true`. A note listing rejected paths with rule IDs and applied paths (each capped at 100) comes first (`REJECTED_CHANGES_PREFIX`). The server's first text block is prefixed as sandboxed output, and `structuredContent` is dropped. A `FileChangeEvent` is emitted only when there were changes: at most 20 entries, bounded paths, no `text`, and callback errors are only logged.
   - **Excluded paths** (`.git/`, `node_modules/`, `.env`…): server writes there are now reported, evaluated, forced to DENY if the evaluator allows them, never applied, and removed from staging. The excluded scan stops after `maxChangesPerCall + 1` entries (new `maxChangesPerCall` option on `createStagingArea`, default 1000). Excluded entries are not hashed, and `text` is read only up to `maxFileBytes`.
@@ -54,12 +60,12 @@ Now:
   - **Fail closed:** any sync/diff/apply/revert error returns a `STAGING_ERROR_PREFIX` tool error (naming paths already applied, via the new `StagingApplyError` in `staging.ts`) and breaks staging. Every later allowed call is refused without forwarding until restart, and so are calls before `initStaging()` has run.
   - `initStaging(staging, { serverId, initial })` reverts changes the server made before any call, emits a `<startup>` event (WRITE_NOT_ALLOWED, "change made before any tool call"), and throws if staging fails.
   - The interceptor branches on `decision` only. See [DECISIONS §12](docs/DECISIONS.md).
-  - **Change evaluator:** `src/security/changes.ts` is not on `main` yet, so the default is the existing reject-all stub `src/proxy/stubs/evaluate-file-changes.stub.ts` (now with a TODO to swap it). No second stub was added.
+  - **Change evaluator:** `src/index.ts` injects Winston's `evaluateFileChanges` from `src/security/changes.ts`. Without an injected one (tests only), the default is still the reject-all stub `src/proxy/stubs/evaluate-file-changes.stub.ts`.
 - **`src/proxy/upstream.ts`**: `connectUpstream(config, { onClose? })` spawns the server over stdio with a safe default env and re-emits its stderr with a prefix. It has a connect timeout, per-call `timeout`/`maxTotalTimeout`/`signal`, paginated `listTools` (20-page cap), a `connected` getter, and `UpstreamUnavailableError` once closed. No reconnect.
-  - **Docker launch mode** (on `aarav/docker-upstream`): `connectUpstream(server, { launch })` takes an exported, Zod-validated `UpstreamLaunch`. It is either `{ mode: 'local', command, args, env?, cwd? }` (the old behavior, built by `localLaunch(server)`) or `{ mode: 'docker', image, command, args, workspaceDir, serverDir?, env?, user?, memory?, pidsLimit? }`.
-  - Docker mode runs the plan's locked-down container: `--network none --read-only --cap-drop ALL --security-opt no-new-privileges`, host `uid:gid`, pids 128, 512m, tmpfs `/tmp`, staging rw at `/workspace`, server code ro at `/server`, and only explicit `-e` vars. `buildDockerArgs(launch)` builds the argv. It is exported, unit-tested and never uses a shell.
+  - **Docker launch mode**: `connectUpstream(server, { launch })` takes an exported, Zod-validated `UpstreamLaunch`. It is either `{ mode: 'local', command, args, env?, cwd? }` (the old behavior, built by `localLaunch(server)`) or `{ mode: 'docker', image, command, args, workspaceDir, serverDir?, env?, user?, memory?, pidsLimit? }`.
+  - Docker mode runs the plan's locked-down container: `--network none --read-only --cap-drop ALL --security-opt no-new-privileges`, host `uid:gid`, pids 128, 512m with `--memory-swap` equal (no swap), tmpfs `/tmp`, staging rw at `/workspace`, server code ro at `/server`, and only explicit `-e` vars. `buildDockerArgs(launch)` builds the argv. It is exported, unit-tested and never uses a shell.
   - Preflight runs `docker version`, then `docker image inspect`. If either fails it throws `SandboxUnavailableError` and refuses to start. It never pulls and never falls back to local mode.
-  - The container is removed with `docker rm -f` on close, on a downstream close, on process exit, and on SIGINT/SIGTERM. Container stderr goes to our stderr as `[upstream:<id>] …`.
+  - The container is removed with `docker rm -f` on close (before the MCP client is closed), on a downstream close, on process exit, and on SIGINT/SIGTERM. Container stderr goes to our stderr as `[upstream:<id>] …`.
   - `upstream.launch` / `describeLaunch()` report `{ mode, image?, containerName?, sandboxed }` for the monitor and `/health`. Not wired in yet.
   - `src/index.ts` now passes `launch: localLaunch(config.server)` explicitly. No new config keys; behavior is unchanged.
   - See [DECISIONS §11](docs/DECISIONS.md).
@@ -88,10 +94,10 @@ Now:
 
 ## Docker integration: verified (2026-10-24)
 
-- **Tests:** `tests/upstream-docker.test.ts` 32/32 on `main` with Docker 29.9.2 and `node:22-slim`, integration tests included (34/34 on `aarav/docker-fixes`).
+- **Tests:** `tests/upstream-docker.test.ts` with Docker 29.9.2 and `node:22-slim`, integration tests included (36/36 now).
 - **Live container** (`config/sandbox.yaml`, `docker inspect`): network `none`, read-only root, CapDrop `ALL` (CapEff 0), `no-new-privileges`, user `501:20`, 512m / 128 pids, `/tmp` tmpfs `noexec,nosuid`, one bind mount: the staging mirror at `/workspace`.
 - **Preflight:** refuses to start with Docker stopped and with the image missing; nothing is pulled and no staging dir is left.
-- **Fixes on `aarav/docker-fixes`:**
+- **Fixes from the first Docker run** (PR #17):
   - `start`/`dev` run `node --import tsx`: under the `tsx` CLI, Ctrl-C SIGKILLed the firewall before cleanup and left the staging dir behind every time ([DECISIONS §13](docs/DECISIONS.md)). Verified: 3/3 Ctrl-C runs of `npm start` leave no staging dir and no container.
   - Stale staging-dir sweep at startup, guarded by an owner file (pid, start time) next to the mirror, never inside `/workspace`. Verified: after a SIGKILL, the next start removes the dir.
   - Preflight now says "docker CLI not found" or "the Docker daemon isn't responding (is Docker running?)" instead of `(Error)`.
@@ -161,7 +167,7 @@ From `src/proxy/interceptor.ts`:
 
 - ~~`src/security/evaluator.ts` is the deny-all stub~~: Winston's real evaluator landed on `main` in PR #4 (`40ea8e4`). With the shipped policy it returns ALLOW / PROTECTED_PATH / DENIED_DESTINATION / DENIED_TOOL for the four demo calls, consistent with design §7.
 - ~~`demo/mock-server.ts` is a stub~~: landed in PR #3 (`6a7f51d`).
-- **Release gate (§10): all four commands pass** on this machine: `npm run typecheck`, `npm test` (on `aarav/docker-fixes`: 252 passed, 8 todo), `npm run test:docker` with Docker running (34 passed; fails if Docker or `node:22-slim` is missing) and `npm run demo`.
+- **Release gate (§10): all four commands pass** on this machine: `npm run typecheck`, `npm test` (261 passed), `npm run test:docker` with Docker running (36 passed; fails if Docker or `node:22-slim` is missing) and `npm run demo`.
 - **Open policy issues for Winston** (found in a read-only review; no proxy change needed):
   - case-variant protected paths are allowed on macOS
   - relative-path traversal is not resolved
@@ -201,17 +207,17 @@ Not changed in `src/shared/contracts.ts`; each needs Aarav, Winston and Kritish 
    - implement `tests/e2e.test.ts`
    - move "Claude Code setup (verified)" into the README and fix the stale status line
    - switch the demo's block detection to `_meta['mcp-firewall/decision']`
-   - **integration:** have the config loader map `server.sandbox` onto `UpstreamLaunch` (exported from `src/proxy/upstream.ts`, with TSDoc on every field) and pass it as `connectUpstream(config.server, { launch })` in `src/index.ts`. Docker mode is selected only that way.
+   - ~~**integration:** have the config loader map `server.sandbox` onto `UpstreamLaunch` (exported from `src/proxy/upstream.ts`, with TSDoc on every field) and pass it as `connectUpstream(config.server, { launch })` in `src/index.ts`. Docker mode is selected only that way.~~ Done (PR #18).
 5. ~~Shutdown hook for the monitor~~: already in place. `src/index.ts` closes it on shutdown, and port 3000 is freed after SIGINT.
 6. **Staged writes:**
    - ~~Contract PR~~: merged (PR #10). See [DECISIONS §9](docs/DECISIONS.md).
    - ~~`src/proxy/staging.ts`~~: merged (PR #11).
    - ~~Docker launch mode in upstream~~: merged (PR #12). Integration tests verified with Docker (2026-10-24).
-   - ~~Interceptor integration~~: built on `aarav/interceptor-staging`.
+   - ~~Interceptor integration~~: merged (PR #16).
    - **Next, in order:**
-     1. ~~Run the docker-upstream integration tests on `main` with Docker~~: 32/32; fixes on `aarav/docker-fixes`.
-     2. **Kritish: `toUpstreamLaunch` in the config loader.** Map `server.sandbox` (and `policy.staging`) onto `UpstreamLaunch` from `src/proxy/upstream.ts`. Refuse to load if sandbox mode is set without `policy.staging`.
-     3. **`src/index.ts` wiring**, in this order. Each step must throw and stop startup on failure:
+     1. ~~Run the docker-upstream integration tests on `main` with Docker~~: done; fixes merged (PR #17).
+     2. ~~**Kritish: `toUpstreamLaunch` in the config loader.**~~ Done (PR #18). Map `server.sandbox` (and `policy.staging`) onto `UpstreamLaunch` from `src/proxy/upstream.ts`. Refuse to load if sandbox mode is set without `policy.staging`.
+     3. ~~**`src/index.ts` wiring**~~: done (PR #18), in this order. Each step must throw and stop startup on failure:
         1. `createStagingArea({ projectRoot, extraExcludes, maxFileBytes, maxChangesPerCall })` from `policy.staging`
         2. `initial = await area.sync()`
         3. `toUpstreamLaunch(config, area.stagingRoot)` → docker launch with `workspaceDir` = the staging dir
@@ -219,11 +225,11 @@ Not changed in `src/shared/contracts.ts`; each needs Aarav, Winston and Kritish 
         5. `await initStaging(staging, { serverId, initial })`
 
         Then pass `staging` to `createInterceptor` (with `onFileChangeEvent` wired to the monitor, Kritish), and call `area.dispose()` on shutdown.
-   - Swap the reject-all stub for Winston's `evaluateFileChanges` once `src/security/changes.ts` lands.
+   - ~~Swap the reject-all stub for Winston's `evaluateFileChanges`~~: done on `aarav/wire-change-evaluator`.
 7. **From the Cerberus 4.1 audit (2026-10-24)**, in order:
    1. ~~Restore the deleted suite; fix `npm run test:docker`~~: done for Aarav's suites. Other owners: decide on the monitor, events, contracts, security and e2e suites.
-   2. **Blocked on Winston:** land `evaluateFileChanges` in `src/security`. Aarav then injects it in `src/index.ts` and turns `GAP 1g` into a plain test.
-   3. ~~Orphan sweep, `--pull=never`, async `publish`~~: done. Still open (Aarav): remove the container before closing the client so a server that ignores EOF can't push shutdown past the 2 s cap; consider `--memory-swap` equal to `--memory`; observe a thenable from `onFileChangeEvent` like `publish`.
+   2. ~~Inject `evaluateFileChanges` in `src/index.ts`; `GAP 1g` → plain test~~: done.
+   3. ~~Orphan sweep, `--pull=never`, async `publish`; container removed before the client closes; `--memory-swap` = `--memory`; `onFileChangeEvent` thenable observed~~: done.
    4. **Blocked on Winston:** wire `getSession` or drop the unused taint input (Aarav does the wiring).
    5. **Blocked on the team:** agree on DECISIONS §15 and the `BlockNotice` shape. Aarav then runs the Claude Code 2.1.310 elicitation spike (declared capability on our `2025-11-25` connection, Esc and no-answer behavior, cancel on timeout) before implementing.
    6. Team: review the `docker` npm dependency added in `d566d4e`.

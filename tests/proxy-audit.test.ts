@@ -24,7 +24,6 @@ import {
 } from '../src/proxy/interceptor.js';
 import { startProxyServer } from '../src/proxy/server.js';
 import {
-  defaultEvaluateFileChanges,
   initStaging,
   STAGED_META_KEY,
   STAGING_ERROR_PREFIX,
@@ -32,6 +31,7 @@ import {
   type StagingDeps,
 } from '../src/proxy/staged-call.js';
 import { createStagingArea, StagingLock, type StagingArea } from '../src/proxy/staging.js';
+import { evaluateFileChanges } from '../src/security/changes.js';
 import {
   buildDockerArgs,
   connectUpstream,
@@ -42,7 +42,6 @@ import {
 } from '../src/proxy/upstream.js';
 import type {
   EvaluateFileChanges,
-  FileChange,
   FirewallEvent,
   FirewallPolicy,
   PolicyDecision,
@@ -418,6 +417,7 @@ describe('1e Docker flags', () => {
       '--user', '501:20',
       '--pids-limit', '128',
       '--memory', '512m',
+      '--memory-swap', '512m',
       '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
       '--mount', `type=bind,src=${real},dst=/workspace`,
       '--label', 'mcp-firewall=1',
@@ -478,6 +478,35 @@ describe('1f container cleanup', () => {
     expect(dockerArgv()).toContain(name);
     await upstream.close();
     expect(removals()).toBe(1);
+  });
+
+  // A server that ignores stdin EOF would otherwise hold client.close() until shutdown's 2 s cap.
+  it('close() removes the container before closing the client', async () => {
+    const ws = await mkdtemp(path.join(tmpdir(), 'mcpfw-audit-ws-'));
+    cleanups.push(() => rm(ws, { recursive: true, force: true }));
+    const order: string[] = [];
+    const upstream = await connectUpstream(
+      { id: 'fs', command: 'node', args: [], timeoutMs: 5_000 },
+      {
+        launch: { mode: 'docker', image: 'mcp-firewall-sandbox:dev', command: 'node', workspaceDir: ws },
+        execFile: async (_file, args) => {
+          if (args[0] === 'rm') order.push('docker rm -f');
+          return { stdout: '', stderr: '' };
+        },
+        createTransport: () => {
+          const transport = new StdioClientTransport({ command: process.execPath, args: [fixture], stderr: 'pipe' });
+          const closeTransport = transport.close.bind(transport);
+          transport.close = async () => {
+            order.push('client close');
+            return closeTransport();
+          };
+          return transport;
+        },
+      },
+    );
+    cleanups.push(() => upstream.close());
+    await upstream.close();
+    expect(order).toEqual(['docker rm -f', 'client close']);
   });
 
   it('removes the container when the downstream exits on its own', async () => {
@@ -692,13 +721,84 @@ describe('1g staged-call integration', () => {
     expect(h.forwards()).toBe(0);
   });
 
-  // src/index.ts builds StagingDeps without evaluateFileChanges, so the runtime uses
-  // defaultEvaluateFileChanges = the reject-all stub. src/security has no evaluateFileChanges.
-  it.fails('GAP 1g: the runtime file-change evaluator ignores policy.staging (reject-all stub)', () => {
+  // StagingDeps as src/index.ts builds them in sandbox mode: config/sandbox.yaml's policy
+  // and Winston's evaluateFileChanges, on a real staging area.
+  it('1g: the runtime evaluator enforces policy.staging: a writable path lands, a .git hook is PERSISTENCE_PATH', async () => {
     const { policy: sandboxPolicy } = loadConfig(path.join(repoRoot, 'config/sandbox.yaml'));
     expect(sandboxPolicy.staging?.writablePaths).toContain('src/**');
-    const change = { path: 'src/greet.js', kind: 'modify' } as FileChange;
-    const [decision] = defaultEvaluateFileChanges([change], sandboxPolicy) as { decision: string }[];
-    expect(decision?.decision).toBe('ALLOW');
+    const project = await mkdtemp(path.join(tmpdir(), 'mcpfw-audit-project-'));
+    await mkdir(path.join(project, 'src'));
+    await writeFile(path.join(project, 'src/a.js'), 'original\n');
+    const area = await createStagingArea({ projectRoot: project, maxFileBytes: 65_536, maxChangesPerCall: 20 });
+    cleanups.push(() => rm(project, { recursive: true, force: true }), () => area.dispose());
+    const initial = await area.sync();
+    const deps: StagingDeps = { area, lock: new StagingLock(), evaluateFileChanges, policy: sandboxPolicy };
+    await initStaging(deps, { serverId: 'fs', initial, log: () => {} });
+
+    const h = harness({
+      staging: deps,
+      forward: async (toolName) => {
+        if (toolName === 'edit') {
+          await writeFile(path.join(area.stagingRoot, 'src/a.js'), 'edited by the server\n');
+        } else {
+          await mkdir(path.join(area.stagingRoot, '.git/hooks'), { recursive: true });
+          await writeFile(path.join(area.stagingRoot, '.git/hooks/pre-commit'), 'echo installed\n');
+        }
+        return { content: [{ type: 'text', text: 'ok' }] };
+      },
+    });
+
+    const edit = await h.handler('edit', { path: 'src/a.js' });
+    expect(edit.isError).toBeFalsy();
+    expect(edit._meta?.[STAGED_META_KEY]).toEqual({
+      applied: 1,
+      rejected: 0,
+      changes: [{ path: 'src/a.js', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' }],
+    });
+    expect(await readFile(path.join(project, 'src/a.js'), 'utf8')).toBe('edited by the server\n');
+
+    const hook = await h.handler('hook', { path: '.git/hooks/pre-commit' });
+    expect(hook.isError).toBe(true);
+    expect(hook._meta?.[STAGED_META_KEY]).toEqual({
+      applied: 0,
+      rejected: 1,
+      changes: [{ path: '.git/hooks/pre-commit', decision: 'DENY', ruleId: 'PERSISTENCE_PATH' }],
+    });
+    await expect(readFile(path.join(project, '.git/hooks/pre-commit'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(path.join(area.stagingRoot, '.git/hooks/pre-commit'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('a thenable returned by onFileChangeEvent is observed; its rejection is logged redacted and never changes the result', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    const logs: string[] = [];
+    try {
+      const s = await stagedProject(allowAll);
+      s.deps.onFileChangeEvent = (async () => {
+        throw Object.assign(new Error('monitor down while handling src/a.js'), { code: 'EBUSDOWN' });
+      }) as never;
+      const h = harness({
+        staging: s.deps,
+        log: (l) => logs.push(l),
+        forward: async () => {
+          await writeFile(s.inStaging('src/a.js'), 'from the server\n');
+          return { content: [{ type: 'text', text: 'ok' }] };
+        },
+      });
+      const result = await h.handler('write_file', { path: 'src/a.js' });
+      expect(result.isError).toBeFalsy();
+      expect(textOf(result)).toBe('ok');
+      expect(result._meta?.[STAGED_META_KEY]).toMatchObject({ applied: 1, rejected: 0 });
+      expect(await readFile(s.inProject('src/a.js'), 'utf8')).toBe('from the server\n');
+      await new Promise((r) => setTimeout(r, 20));
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+    expect(unhandled).toEqual([]);
+    const failures = logs.filter((l) => l.includes('file change event callback failed'));
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatch(/callback failed: Error code=EBUSDOWN$/);
+    expect(logs.join('\n')).not.toContain('monitor down');
   });
 });
