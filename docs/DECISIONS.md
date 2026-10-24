@@ -81,3 +81,13 @@ Other child-process choices:
 ## 7. Shutdown
 
 `src/index.ts` shuts down on agent disconnect, stdin end, `SIGINT` or `SIGTERM`. It closes the upstream, the proxy server and the monitor in parallel, waits at most 2 s, then exits 0. A downstream crash does **not** shut the proxy down: it keeps answering so that DENYs stay visible and allowed calls fail with a clear error.
+
+## 8. Claude Code launches the firewall via the repo's absolute `tsx`, not `npx`
+
+The registered command is `<repo>/node_modules/.bin/tsx <repo>/src/index.ts --config <abs config>`, with every path absolute. The verified form is `claude mcp add --scope local mcp-firewall-dev -- "$PWD/node_modules/.bin/tsx" "$PWD/src/index.ts" --config "$HOME/.config/mcp-firewall-dev/firewall.yaml"`, run from the repo root. The shell expands `$PWD` and `$HOME` before Claude Code stores the command.
+
+- Claude Code launches stdio servers from the **session's working directory**, which is whichever project you started `claude` in. Its MCP log records that `cwd` for every server event.
+- `npx tsx` looks for `tsx` in the `node_modules/.bin` of that directory's project. From the firewall repo itself that works. From any other project it either finds a different `tsx` (global or the project's own) or fetches an unpinned one from the registry. Fetching adds network time against Claude Code's 30 s connection timeout (the timeout is in its MCP log; the fetch time was not measured).
+- `<repo>/node_modules/.bin/tsx` is the version from `package-lock.json`, installed by `npm ci`. It gives the same result from any working directory and needs no network.
+- A relative `src/index.ts`, or a relative `--config`, would also resolve against the session's working directory. `src/index.ts` calls `resolve(values.config)`, so the config path must be absolute too. Paths *inside* the config (`server.cwd`) are resolved relative to the config file by the loader, and the default config is found via `import.meta.url`.
+- Registration scope is separate from path resolution. `--scope local` stores the server for the folder `claude mcp add` was run in, so it only appears in sessions started there. Absolute paths make the command correct in *any* scope.

