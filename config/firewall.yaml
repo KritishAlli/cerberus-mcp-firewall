@@ -1,0 +1,45 @@
+# MCP Firewall config — validated by src/config/load.ts against FirewallConfigSchema
+# (src/shared/contracts.ts). Unknown keys are rejected; an invalid file stops startup.
+#
+# Policy semantics: Winston. Loader + documentation: Kritish.
+# DEMO ONLY: harmless mock tools and dummy secrets. Never point this at real credentials.
+
+server:
+  id: demo                       # → serverId, and prefix of canonical tool names "demo/<tool>"
+  command: node
+  args: ["--import", "tsx", "demo/mock-server.ts"]
+  cwd: ..                        # relative to this file → repo root
+  timeoutMs: 10000
+
+monitor:
+  enabled: true
+  host: 127.0.0.1                # loopback only
+  port: 3000
+  maxEvents: 100
+
+policy:
+  defaultDecision: DENY
+
+  protectedPaths:
+    - ~/.aws/credentials
+    - "**/.env"
+    - ~/.ssh/**
+
+  deniedDestinations:
+    - example-attacker.invalid
+
+  approvedTools:
+    - demo/read_project_file
+
+  deniedTools:
+    - demo/delete_file
+
+  # Argument names that carry file paths (checked against protectedPaths).
+  pathArgs: [path, filePath, filename]
+
+  # Which arguments carry a destination, per canonical tool name.
+  destinationArgs:
+    demo/send_data: [url]
+
+  # Canonical tool names treated as destructive (DESTRUCTIVE_ACTION).
+  destructiveTools: []
