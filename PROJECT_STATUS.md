@@ -9,23 +9,27 @@ Merged to `main` (PR #2). Rationale for each choice: [`docs/DECISIONS.md`](docs/
 - **`src/proxy/server.ts`**: `startProxyServer(upstream, handler, { transport?, onClose? })` is a low-level `Server`. `tools/list` passes through unchanged, `tools/call` goes to the interceptor with the cancellation signal, and downstream `instructions` are not forwarded.
 - **`src/index.ts`**: passes the signal through, and shuts down cleanly on agent disconnect, stdin end, SIGINT or SIGTERM (2 s cap). A downstream crash keeps the proxy up and fails closed.
 - **`tests/fixtures/counting-server.ts`**: test-only stdio server (`echo`, `read_file`, `structured`, `tool_error`, `hang`, `crash`, `get_call_counts`) with an optional `--counts-file`.
-- **`tests/proxy.test.ts`**: 65 tests in tests/proxy.test.ts; full suite 75 passing (incl. 10 shared contract tests), 20 todo in teammates' files. Coverage:
+- **`tests/proxy.test.ts`**: 66 tests in tests/proxy.test.ts; full suite 90 passing (incl. 10 shared contract and 12 security tests), 8 todo (all in `tests/e2e.test.ts`). Coverage:
   - unit tests (T01, T02, T06, T09, T11, fail-closed evaluator and publish, arg mutation, summary bounds, signal)
   - integration through the real stdio fixture (listing identical to direct, T01/T02 counts, structured results and tool errors, unknown tools, hang timeout, crash)
-  - CLI smoke test of `src/index.ts`, and a CLI run against `demo/mock-server.ts` (listing parity, all four tools BLOCKED, zero counts)
+  - CLI smoke test of `src/index.ts`. With the real evaluator, its approved `fixture/echo` call now takes the forwarded (ALLOW) branch.
+  - CLI run against `demo/mock-server.ts` with the shipped `config/firewall.yaml` policy and the real evaluator:
+    - listing parity with a direct connection
+    - T01: `read_project_file` is ALLOWed, forwarded once, and its result is identical to a direct call
+    - T02–T04: PROTECTED_PATH, DENIED_DESTINATION and DENIED_TOOL are each BLOCKED with a count of 0
 
 ## Claude Code setup (verified)
 
-**"Claude Code can connect" (design §6): verified** by Aarav in a manual Claude Code session on 2026-10-23 (macOS). The downstream was `demo/mock-server.ts` and the evaluator was the deny-all stub.
+**"Claude Code can connect" (design §6): verified** by Aarav in manual Claude Code sessions on 2026-10-23 (macOS), with `demo/mock-server.ts` as the downstream. The first session ran with the deny-all evaluator stub. The ALLOW re-check ran with Winston's real evaluator (PR #4) and the shipped policy.
 
 | Check | Result |
 | --- | --- |
 | Connection | ✔ `/mcp` shows `mcp-firewall-dev` connected |
 | Tool listing | ✔ `read_project_file`, `read_sensitive_file`, `send_data`, `delete_file` listed through the firewall |
-| BLOCKED path | ✔ `read_project_file` shows `[MCP Firewall] BLOCKED (DEFAULT_DENY)` as a tool error |
+| BLOCKED path | ✔ with the deny-all stub, `read_project_file` shows `[MCP Firewall] BLOCKED (DEFAULT_DENY)` as a tool error |
 | Downstream counts | ✔ all 0 (or file absent): nothing reached the mock |
 | Shutdown | ✔ after `/exit`, `pgrep -fl "counting-server\|src/index.ts"` returns nothing |
-| ALLOW path | ⏳ pending Winston's evaluator (the stub denies everything) |
+| ALLOW path (T01) | ✔ with the real evaluator, `read_project_file` on `README.md` returns the demo README as a normal result. The counts file shows `read_project_file: 1` with the other three tools at 0, and the MCP log has one `ALLOW APPROVED_TOOL` event. **T01 works end to end through a real Claude Code client.** |
 
 The exact command that worked. It was run from the repo root, so `$PWD` is the repo:
 
@@ -58,10 +62,22 @@ From `src/proxy/interceptor.ts`:
 
 ## Blockers
 
-- ~~`demo/mock-server.ts` is a stub~~: it landed on `main` in PR #3 (`6a7f51d`). `tests/proxy.test.ts` ("proxy / CLI with demo/mock-server.ts") runs `src/index.ts` against it. It checks that the proxied `tools/list` equals the mock's direct listing, and that all four tools are BLOCKED with every count at 0.
-- **`npm run demo` fails 6 expectations until Winston's evaluator lands.** All 6 are ALLOW or rule-ID checks; the zero-count checks pass. `MOCK_SERVER_COUNTS_FILE` does not reach the mock through the firewall (safe default env, DECISIONS §6), so use `--counts-file`, as the demo already does.
-- **`.gitignore` on `main` is now Kritish's version** (PR #3 resolved the add/add conflict in its favour). It ignores `.env` / `.env.*`, so a dummy `.env` used to demo a blocked read has to be force-added (`git add -f`) or created at demo time.
-- **`src/security/evaluator.ts` (Winston) is the deny-all stub.** Through the real CLI, every call is BLOCKED today. The CLI smoke test checks "count goes up only if the response was not BLOCKED", which holds for both the stub and a real evaluator, but only the BLOCKED branch actually runs until Winston merges. The ALLOW path is covered by the integration tests, which use a test-only allowlist evaluator.
+- ~~`src/security/evaluator.ts` is the deny-all stub~~: Winston's real evaluator landed on `main` in PR #4 (`40ea8e4`). With the shipped policy it returns ALLOW / PROTECTED_PATH / DENIED_DESTINATION / DENIED_TOOL for the four demo calls, consistent with design §7.
+- ~~`demo/mock-server.ts` is a stub~~: landed in PR #3 (`6a7f51d`).
+- **Release gate (§10): all three commands pass** on this machine: `npm run typecheck`, `npm test` (90 passed, 8 todo) and `npm run demo` (DEMO PASSED, all 12 checks).
+- **Open policy issues for Winston** (found in a read-only review; no proxy change needed):
+  - case-variant protected paths are allowed on macOS
+  - relative-path traversal is not resolved
+  - `file://` paths and trailing slashes slip past
+  - one precedence edge case vs §7
+
+  They don't affect the scripted demo, whose mock never touches the disk, but they are real holes for any downstream that does read files.
+- **Still open (Kritish):**
+  - the monitor is a stub
+  - `tests/e2e.test.ts` is 8 todos
+  - the README status line and Claude Code TODO are stale
+  - the demo detects blocks by parsing prose rather than `_meta`
+- **`.gitignore` on `main` is Kritish's version.** It ignores `.env` / `.env.*`, so a dummy `.env` used to demo a blocked read has to be force-added (`git add -f`) or created at demo time. `MOCK_SERVER_COUNTS_FILE` does not reach the mock through the firewall (safe default env, DECISIONS §6); use `--counts-file`, as the demo does.
 
 ## Limitations
 
@@ -74,7 +90,11 @@ From `src/proxy/interceptor.ts`:
 
 ## Next steps
 
-1. ~~Merge `aarav/proxy`~~: done (PR #2, `06928f2`).
-2. Re-run the CLI smoke test after Winston's evaluator lands, to exercise the ALLOW branch end to end. Then re-run the Claude Code check to confirm the ALLOW path (`demo/read_project_file`).
-3. With Kritish: confirm the e2e/demo use `BLOCKED_PREFIX` and `FIREWALL_META_KEY`. Move "Claude Code setup (verified)" into the README and fix the stale status line.
-4. Optional, after acceptance tests: forward `list_changed`, and a shutdown hook for the monitor once it holds real resources.
+1. ~~Merge `aarav/proxy`~~: done (PR #2). ~~Exercise the ALLOW branch end to end~~: done. It is covered by the CLI smoke test, the mock integration test and `npm run demo`.
+2. ~~Re-run the manual Claude Code check with the real evaluator~~: done. T01 verified end to end in Claude Code.
+3. Winston: address the policy issues above (path case-folding on macOS, relative-path handling, `file://` and trailing-slash normalization), then re-run `npm run check`. The mock integration test should keep passing unchanged.
+4. Kritish:
+   - implement the monitor and `tests/e2e.test.ts`
+   - move "Claude Code setup (verified)" into the README and fix the stale status line
+   - switch the demo's block detection to `_meta['mcp-firewall/decision']`
+5. Optional, after acceptance tests: forward `list_changed`, and a shutdown hook for the monitor once it holds real resources.
