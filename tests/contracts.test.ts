@@ -2,9 +2,12 @@
  * SHARED — baseline tests for the frozen contract and scaffold invariants.
  * These must stay green on main at all times.
  */
-import { resolve } from 'node:path';
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ConfigError, loadConfig, parseConfig } from '../src/config/load.js';
+import { ConfigError, loadConfig, parseConfig, toUpstreamLaunch } from '../src/config/load.js';
+import { UpstreamLaunchSchema } from '../src/proxy/upstream.js';
 import { evaluateToolCall } from '../src/security/evaluator.js';
 import { evaluateFileChangesStub } from '../src/proxy/stubs/evaluate-file-changes.stub.js';
 import {
@@ -163,6 +166,168 @@ describe('staged-writes contract', () => {
       ['a.txt', 'DENY', 'WRITE_NOT_ALLOWED'],
     ]);
     for (const d of decisions) expect(ChangeDecisionSchema.safeParse(d).success).toBe(true);
+  });
+});
+
+describe('sandbox + staging config', () => {
+  const staging = `  staging: { writablePaths: ["src/**"], protectedWritePaths: [".git/**"], maxFileBytes: 65536, maxChangesPerCall: 20 }\n`;
+  const sandboxed = (sandbox: string, policyExtra = staging) =>
+    `server:\n  id: demo\n  command: node\n  sandbox: ${sandbox}\npolicy:\n  defaultDecision: DENY\n${policyExtra}`;
+
+  /** Temp dir with project/ and server/ next to the config file. */
+  function writeSandboxConfig(sandbox: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'fw-config-'));
+    mkdirSync(join(dir, 'project'));
+    mkdirSync(join(dir, 'server'));
+    writeFileSync(join(dir, 'file.txt'), '');
+    const path = join(dir, 'firewall.yaml');
+    writeFileSync(path, sandboxed(sandbox));
+    return path;
+  }
+
+  it('existing configs without sandbox or staging still load', () => {
+    expect(loadConfig(examplePath).server.sandbox).toBeUndefined();
+    expect(loadConfig(examplePath).policy.staging).toBeUndefined();
+  });
+
+  it('sandbox mode requires policy.staging', () => {
+    expect(() => parseConfig(sandboxed('{ image: fw-sandbox, project: p, serverDir: s }', ''))).toThrow(
+      /requires a policy.staging/,
+    );
+  });
+
+  it('rejects incomplete or unknown sandbox keys', () => {
+    expect(() => parseConfig(sandboxed('{ image: fw-sandbox }'))).toThrow(ConfigError);
+    expect(() => parseConfig(sandboxed('{ project: p }'))).toThrow(ConfigError);
+    expect(() => parseConfig(sandboxed('{ image: fw-sandbox, project: p, serverDir: s, network: host }'))).toThrow(
+      ConfigError,
+    );
+  });
+
+  it('rejects image values that could be read as docker flags', () => {
+    expect(() => parseConfig(sandboxed('{ image: "--privileged", project: p, serverDir: s }'))).toThrow(ConfigError);
+    expect(() => parseConfig(sandboxed('{ image: "img --rm", project: p, serverDir: s }'))).toThrow(ConfigError);
+    expect(parseConfig(sandboxed('{ image: "node:22-slim", project: p, serverDir: s }')).server.sandbox?.image).toBe(
+      'node:22-slim',
+    );
+  });
+
+  it('applies resource defaults and leaves user and env unset', () => {
+    const sandbox = parseConfig(sandboxed('{ image: fw-sandbox, project: p }')).server.sandbox;
+    expect(sandbox).toEqual({ image: 'fw-sandbox', project: 'p', memory: '512m', pidsLimit: 128 });
+  });
+
+  it('rejects a root user, bad memory, pids or env names', () => {
+    const bad = [
+      '{ image: fw-sandbox, project: p, user: "0:0" }',
+      '{ image: fw-sandbox, project: p, user: "node" }',
+      '{ image: fw-sandbox, project: p, memory: "lots" }',
+      '{ image: fw-sandbox, project: p, pidsLimit: 0 }',
+      '{ image: fw-sandbox, project: p, env: { "A=B": x } }',
+    ];
+    for (const sandbox of bad) expect(() => parseConfig(sandboxed(sandbox)), sandbox).toThrow(ConfigError);
+    expect(parseConfig(sandboxed('{ image: fw-sandbox, project: p, user: "1000:1000" }')).server.sandbox?.user).toBe(
+      '1000:1000',
+    );
+  });
+
+  it('refuses server.cwd in sandbox mode', () => {
+    const text = sandboxed('{ image: fw-sandbox, project: p }').replace('  command: node\n', '  command: node\n  cwd: ..\n');
+    expect(() => parseConfig(text)).toThrow(/server.cwd is not allowed/);
+  });
+
+  it('resolves project and serverDir against the config file', () => {
+    const path = writeSandboxConfig('{ image: fw-sandbox, project: project, serverDir: server }');
+    const { sandbox } = loadConfig(path).server;
+    expect(sandbox?.project).toBe(realpathSync(join(dirname(path), 'project')));
+    expect(sandbox?.serverDir).toBe(realpathSync(join(dirname(path), 'server')));
+  });
+
+  it('refuses a missing or non-directory project or serverDir', () => {
+    expect(() => loadConfig(writeSandboxConfig('{ image: fw-sandbox, project: nope, serverDir: server }'))).toThrow(
+      /does not exist/,
+    );
+    expect(() => loadConfig(writeSandboxConfig('{ image: fw-sandbox, project: project, serverDir: file.txt }'))).toThrow(
+      /not a directory/,
+    );
+  });
+
+  it('refuses a serverDir that overlaps the project', () => {
+    expect(() => loadConfig(writeSandboxConfig('{ image: fw-sandbox, project: project, serverDir: . }'))).toThrow(
+      /must not overlap/,
+    );
+    expect(() => loadConfig(writeSandboxConfig('{ image: fw-sandbox, project: project, serverDir: project }'))).toThrow(
+      /must not overlap/,
+    );
+  });
+
+  it('serverDir is optional', () => {
+    const path = writeSandboxConfig('{ image: fw-sandbox, project: project }');
+    expect(loadConfig(path).server.sandbox?.serverDir).toBeUndefined();
+  });
+});
+
+describe('toUpstreamLaunch', () => {
+  const staging = `  staging: { writablePaths: ["src/**"], protectedWritePaths: [".git/**"], maxFileBytes: 65536, maxChangesPerCall: 20 }\n`;
+
+  function sandboxServer(sandbox: string) {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'fw-launch-')));
+    mkdirSync(join(dir, 'project'));
+    mkdirSync(join(dir, 'server'));
+    mkdirSync(join(dir, 'staging'));
+    const path = join(dir, 'firewall.yaml');
+    writeFileSync(
+      path,
+      `server:\n  id: demo\n  command: node\n  args: [/server/index.js, /workspace]\n  sandbox: ${sandbox}\npolicy:\n  defaultDecision: DENY\n${staging}`,
+    );
+    return { dir, server: loadConfig(path).server };
+  }
+
+  it('maps a plain server to a local launch with an absolute cwd', () => {
+    const server = loadConfig(examplePath).server;
+    expect(toUpstreamLaunch(server)).toEqual({
+      mode: 'local',
+      command: server.command,
+      args: server.args,
+      cwd: resolve(dirname(examplePath), '..'),
+    });
+  });
+
+  it('maps server.sandbox to a docker launch with defaults', () => {
+    const { dir, server } = sandboxServer('{ image: fw-sandbox, project: project, serverDir: server, env: { LOG: "1" } }');
+    const launch = toUpstreamLaunch(server, join(dir, 'staging'));
+    expect(launch).toMatchObject({
+      mode: 'docker',
+      image: 'fw-sandbox',
+      command: 'node',
+      args: ['/server/index.js', '/workspace'],
+      workspaceDir: join(dir, 'staging'),
+      serverDir: join(dir, 'server'),
+      env: { LOG: '1' },
+      memory: '512m',
+      pidsLimit: 128,
+    });
+    expect(launch.mode === 'docker' && launch.user).toMatch(/^\d+:\d+$/);
+    expect(launch.mode === 'docker' && launch.user).not.toMatch(/^0:/);
+    expect(launch).not.toHaveProperty('cwd');
+    // What upstream validates again before running docker.
+    expect(UpstreamLaunchSchema.safeParse(launch).success).toBe(true);
+  });
+
+  it('keeps an explicit user and omits unset serverDir and env', () => {
+    const { dir, server } = sandboxServer('{ image: fw-sandbox, project: project, user: "1234:5678" }');
+    const launch = toUpstreamLaunch(server, join(dir, 'staging'));
+    expect(launch).toMatchObject({ user: '1234:5678' });
+    expect(launch).not.toHaveProperty('serverDir');
+    expect(launch).not.toHaveProperty('env');
+  });
+
+  it('refuses sandbox mode without a staging dir, or with one overlapping the project', () => {
+    const { dir, server } = sandboxServer('{ image: fw-sandbox, project: project }');
+    expect(() => toUpstreamLaunch(server)).toThrow(ConfigError);
+    expect(() => toUpstreamLaunch(server, join(dir, 'project'))).toThrow(/must not overlap/);
+    expect(() => toUpstreamLaunch(server, join(dir, 'project', 'sub'))).toThrow(/must not overlap/);
+    expect(() => toUpstreamLaunch(server, dir)).toThrow(/must not overlap/);
   });
 });
 

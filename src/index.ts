@@ -10,12 +10,13 @@ import { dirname, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { loadConfig } from './config/load.js';
+import { loadConfig, toUpstreamLaunch } from './config/load.js';
 import { publishEvent } from './observability/events.js';
 import { startMonitor, type MonitorHandle } from './observability/monitor.js';
 import { createInterceptor } from './proxy/interceptor.js';
 import { startProxyServer, type ProxyServerHandle } from './proxy/server.js';
-import { connectUpstream, localLaunch } from './proxy/upstream.js';
+import { createStagingArea, type StagingArea } from './proxy/staging.js';
+import { connectUpstream } from './proxy/upstream.js';
 import { evaluateToolCall } from './security/evaluator.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -41,12 +42,24 @@ async function main(): Promise<void> {
 
   let shuttingDown = false;
   // A downstream crash does not stop the proxy: later forwards fail closed, DENYs still BLOCK.
-  // Local launch from the existing `server` section. Docker mode comes from the config loader later.
+  // Sandbox mode: the container only ever gets a staging copy of the project at /workspace,
+  // synced before it starts. Without server.sandbox this is the original local launch.
+  let staging: StagingArea | undefined;
+  const { sandbox } = config.server;
+  if (sandbox) {
+    // The loader guarantees policy.staging exists in sandbox mode.
+    staging = await createStagingArea({ projectRoot: sandbox.project, maxFileBytes: config.policy.staging!.maxFileBytes });
+    await staging.sync();
+  }
+  // No Docker, missing image, bad launch: refuse to start, and don't leave the staging copy behind.
   const upstream = await connectUpstream(config.server, {
-    launch: localLaunch(config.server),
+    launch: toUpstreamLaunch(config.server, staging?.stagingRoot),
     onClose: () => {
       if (!shuttingDown) console.error('[firewall] downstream server closed; allowed calls will now fail closed');
     },
+  }).catch(async (err: unknown) => {
+    await staging?.dispose();
+    throw err;
   });
   monitor?.setProtectedServers(() => (upstream.connected ? 1 : 0));
   const handleToolCall = createInterceptor({
@@ -62,7 +75,11 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     console.error(`[firewall] shutting down (${reason})`);
-    const closing = Promise.allSettled([upstream.close(), proxy?.close(), monitor?.close()]);
+    const closing = Promise.allSettled([
+      upstream.close().then(() => staging?.dispose()),
+      proxy?.close(),
+      monitor?.close(),
+    ]);
     void Promise.race([closing, delay(SHUTDOWN_TIMEOUT_MS)]).then(() => process.exit(0));
   };
 
