@@ -4,6 +4,7 @@
   Plain HTML/CSS/JS, no React. Uses EventSource('/events').
   Shows ONLY real events and counters: no prepopulated numbers or fake green status.
   Every event field is rendered with textContent, never innerHTML.
+  File-change events show counts, paths and rule IDs only: they never carry contents.
 -->
 <html lang="en">
   <head>
@@ -69,6 +70,11 @@
       .badge.DENY { color: var(--deny); background: var(--deny-bg); }
       .rule { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; }
       #empty { padding: 24px; text-align: center; color: var(--muted); }
+      tr.files td { padding-top: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-word; }
+      tr.files td.line { color: var(--allow); }
+      tr.files.has-rejected td.line { color: var(--deny); }
+      tr.files td.line::before { content: 'files '; color: var(--muted); }
+      tr.call.has-files td { border-bottom: none; }
     </style>
   </head>
   <body>
@@ -110,6 +116,8 @@
 
       function addRow(event) {
         const tr = document.createElement('tr');
+        tr.className = 'call';
+        tr.dataset.requestId = event.requestId;
         tr.appendChild(cell('time', new Date(event.timestamp).toLocaleTimeString()));
         tr.appendChild(cell('tool', event.serverId + '/' + event.toolName));
 
@@ -126,7 +134,43 @@
         tr.appendChild(cell('', event.reason));
         tr.appendChild(cell('summary', event.summary));
         feed.prepend(tr);
+        trimFeed();
+        empty.hidden = true;
+      }
+
+      function trimFeed() {
         while (feed.rows.length > MAX_ROWS) feed.deleteRow(feed.rows.length - 1);
+      }
+
+      function findCallRow(requestId) {
+        for (const row of feed.rows) {
+          if (row.classList.contains('call') && row.dataset.requestId === requestId) return row;
+        }
+        return null;
+      }
+
+      // Goes directly under its call's row. If that call has left the buffer, it stands alone.
+      function addFileChanges(event) {
+        const tr = document.createElement('tr');
+        tr.className = 'files' + (event.rejected > 0 ? ' has-rejected' : '');
+        const call = findCallRow(event.requestId);
+        if (call) {
+          tr.appendChild(cell('', ''));
+          tr.appendChild(cell('', ''));
+        } else {
+          tr.appendChild(cell('time', new Date(event.timestamp).toLocaleTimeString()));
+          tr.appendChild(cell('tool', event.serverId + '/' + event.toolName));
+        }
+        const line = cell('line', event.line);
+        line.colSpan = 3;
+        tr.appendChild(line);
+        if (call) {
+          call.classList.add('has-files');
+          call.after(tr);
+        } else {
+          feed.prepend(tr);
+        }
+        trimFeed();
         empty.hidden = true;
       }
 
@@ -173,6 +217,7 @@
         refreshHealth();
       });
       source.addEventListener('firewall', (e) => addRow(JSON.parse(e.data)));
+      source.addEventListener('filechanges', (e) => addFileChanges(JSON.parse(e.data)));
       source.addEventListener('counts', (e) => setCounts(JSON.parse(e.data)));
       source.addEventListener('error', () => {
         streamOpen = false;

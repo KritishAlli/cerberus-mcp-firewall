@@ -9,7 +9,15 @@
  *
  * stdout is reserved for the MCP protocol — never write to it.
  */
-import { FirewallEventSchema, LIMITS, type FirewallEvent, type PublishEvent } from '../shared/contracts.js';
+import {
+  FileChangeEventSchema,
+  FirewallEventSchema,
+  LIMITS,
+  MAX_FILE_CHANGE_EVENT_PATH_LENGTH,
+  type FileChangeEvent,
+  type FirewallEvent,
+  type PublishEvent,
+} from '../shared/contracts.js';
 
 /** Matches MonitorConfigSchema's default. */
 export const DEFAULT_MAX_EVENTS = 100;
@@ -22,6 +30,10 @@ export interface EventCounts {
 }
 
 export type EventListener = (event: FirewallEvent) => void;
+export type FileChangeListener = (event: FileChangeEvent) => void;
+
+/** Proxy → observability for staged diffs. Same guarantees as PublishEvent. */
+export type PublishFileChangeEvent = (event: FileChangeEvent) => void;
 
 export interface EventBus {
   /** Must never throw and must never influence the allow/deny result. */
@@ -31,7 +43,13 @@ export interface EventBus {
   counts(): EventCounts;
   /** Called with each new redacted event. Returns an unsubscribe function. */
   subscribe(listener: EventListener): () => void;
-  /** Resize the ring (e.g. from config.monitor.maxEvents), dropping the oldest events if needed. */
+  /** Must never throw. Kept in its own ring (same size); does not touch counts(). */
+  publishFileChanges: PublishFileChangeEvent;
+  /** Redacted file-change events currently in their ring, oldest first. */
+  recentFileChanges(): FileChangeEvent[];
+  /** Called with each new redacted file-change event. Returns an unsubscribe function. */
+  subscribeFileChanges(listener: FileChangeListener): () => void;
+  /** Resize both rings (e.g. from config.monitor.maxEvents), dropping the oldest events if needed. */
   setMaxEvents(maxEvents: number): void;
 }
 
@@ -102,6 +120,37 @@ export function redactEvent(event: FirewallEvent, knownSecrets: readonly string[
   };
 }
 
+/** Redacts paths and identifiers, then re-applies the contract's length limits. */
+export function redactFileChangeEvent(event: FileChangeEvent, knownSecrets: readonly string[] = []): FileChangeEvent {
+  const r = (text: string, max: number): string => bounded(redactText(text, knownSecrets), max);
+  return {
+    ...event,
+    requestId: r(event.requestId, LIMITS.identifier),
+    serverId: r(event.serverId, LIMITS.identifier),
+    toolName: r(event.toolName, LIMITS.identifier),
+    changes: event.changes.map((c) => ({ ...c, path: r(c.path, MAX_FILE_CHANGE_EVENT_PATH_LENGTH) })),
+  };
+}
+
+/** The listed entries are a sample, so they can never outnumber the totals. */
+function fileChangeCountsConsistent(event: FileChangeEvent): boolean {
+  const listedApplied = event.changes.filter((c) => c.decision === 'ALLOW').length;
+  return listedApplied <= event.applied && event.changes.length - listedApplied <= event.rejected;
+}
+
+/**
+ * One line for the monitor, e.g. "2 applied, 1 rejected: package.json PERSISTENCE_PATH".
+ * Lists rejected paths only, and never contents (the event has none).
+ */
+export function describeFileChanges(event: FileChangeEvent): string {
+  const head = `${event.applied} applied, ${event.rejected} rejected`;
+  const rejected = event.changes.filter((c) => c.decision === 'DENY');
+  if (rejected.length === 0) return head;
+  const listed = rejected.map((c) => `${c.path} ${c.ruleId}`).join(', ');
+  const unlisted = event.rejected - rejected.length;
+  return `${head}: ${listed}${unlisted > 0 ? `, +${unlisted} more` : ''}`;
+}
+
 // ---------------------------------------------------------------------------
 // Bus
 // ---------------------------------------------------------------------------
@@ -116,6 +165,8 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
   let maxEvents = validMaxEvents(options.maxEvents ?? DEFAULT_MAX_EVENTS);
   const ring: FirewallEvent[] = [];
   const listeners = new Set<EventListener>();
+  const fileRing: FileChangeEvent[] = [];
+  const fileListeners = new Set<FileChangeListener>();
   const counts: EventCounts = { inspected: 0, allowed: 0, denied: 0 };
 
   const safeLog = (line: string): void => {
@@ -160,6 +211,39 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
     }
   };
 
+  const publishFileChanges: PublishFileChangeEvent = (event) => {
+    try {
+      const parsed = FileChangeEventSchema.safeParse(event);
+      if (!parsed.success || !fileChangeCountsConsistent(parsed.data)) {
+        safeLog('[firewall] dropped malformed file-change event');
+        return;
+      }
+      const redacted = FileChangeEventSchema.safeParse(redactFileChangeEvent(parsed.data, knownSecrets));
+      if (!redacted.success) {
+        safeLog('[firewall] dropped file-change event that failed validation after redaction');
+        return;
+      }
+      const stored = Object.freeze({
+        ...redacted.data,
+        changes: Object.freeze(redacted.data.changes.map((c) => Object.freeze(c))) as FileChangeEvent['changes'],
+      });
+
+      fileRing.push(stored);
+      if (fileRing.length > maxEvents) fileRing.splice(0, fileRing.length - maxEvents);
+
+      safeLog(JSON.stringify(stored));
+      for (const listener of [...fileListeners]) {
+        try {
+          listener(stored);
+        } catch {
+          // A broken subscriber must not affect the others or the caller.
+        }
+      }
+    } catch {
+      // Swallow: observability failures must not affect enforcement.
+    }
+  };
+
   return {
     publish,
     recent: () => [...ring],
@@ -170,9 +254,18 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
         listeners.delete(listener);
       };
     },
+    publishFileChanges,
+    recentFileChanges: () => [...fileRing],
+    subscribeFileChanges(listener) {
+      fileListeners.add(listener);
+      return () => {
+        fileListeners.delete(listener);
+      };
+    },
     setMaxEvents(n) {
       maxEvents = validMaxEvents(n);
       if (ring.length > maxEvents) ring.splice(0, ring.length - maxEvents);
+      if (fileRing.length > maxEvents) fileRing.splice(0, fileRing.length - maxEvents);
     },
   };
 }
@@ -181,3 +274,5 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
 export const eventBus = createEventBus();
 
 export const publishEvent: PublishEvent = eventBus.publish;
+/** For the interceptor: one per staged diff, after the call's FirewallEvent. */
+export const publishFileChangeEvent: PublishFileChangeEvent = eventBus.publishFileChanges;

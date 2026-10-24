@@ -4,7 +4,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createEventBus, type EventBus } from '../src/observability/events.js';
 import { startMonitor, type MonitorHandle } from '../src/observability/monitor.js';
-import type { FirewallEvent, MonitorConfig } from '../src/shared/contracts.js';
+import type { FileChangeEvent, FirewallEvent, MonitorConfig } from '../src/shared/contracts.js';
 
 // Port 0 lets the OS pick a free port; the schema forbids it in real config.
 const config: MonitorConfig = { enabled: true, host: '127.0.0.1', port: 0, maxEvents: 100 };
@@ -113,10 +113,57 @@ describe('monitor', () => {
     const ids = frames.filter((f) => f.event === 'firewall').map((f) => (JSON.parse(f.data) as FirewallEvent).requestId);
     expect(ids).toEqual([...old, live].map((e) => e.requestId));
     const readyAt = frames.findIndex((f) => f.event === 'ready');
-    expect(JSON.parse(frames[readyAt]!.data)).toEqual({ replayed: 2 });
+    expect(JSON.parse(frames[readyAt]!.data)).toEqual({ replayed: 2, replayedFileChanges: 0 });
     expect(frames.findIndex((f) => f.event === 'firewall' && f.data.includes(live.requestId))).toBeGreaterThan(readyAt);
     const lastCounts = frames.filter((f) => f.event === 'counts').at(-1)!;
     expect(JSON.parse(lastCounts.data)).toEqual({ inspected: 3, allowed: 2, denied: 1 });
+  });
+
+  it('streams file-change events, buffered then live, with a summary line and no contents', async () => {
+    const bus = quietBus();
+    const call = event({ toolName: 'write_file' });
+    bus.publish(call);
+    const staged: FileChangeEvent = {
+      timestamp: new Date().toISOString(),
+      requestId: call.requestId,
+      serverId: 'demo',
+      toolName: 'write_file',
+      applied: 2,
+      rejected: 1,
+      changes: [
+        { path: 'src/greet.js', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' },
+        { path: 'src/index.js', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' },
+        { path: 'package.json', decision: 'DENY', ruleId: 'PERSISTENCE_PATH' },
+      ],
+    };
+    bus.publishFileChanges(staged);
+    const url = await start(bus);
+
+    const live = { ...staged, requestId: 'req-live', applied: 0, rejected: 1, changes: [staged.changes[2]!] };
+    const frames = await readSSE(
+      url,
+      (f) => f.filter((x) => x.event === 'filechanges').length >= 2,
+      () => setTimeout(() => bus.publishFileChanges(live), 50),
+    );
+
+    const order = frames.map((f) => f.event).filter((e) => e !== 'counts');
+    expect(order).toEqual(['firewall', 'filechanges', 'ready', 'filechanges']);
+    const [replayed, streamed] = frames.filter((f) => f.event === 'filechanges').map((f) => JSON.parse(f.data));
+    expect(replayed).toEqual({ ...staged, line: '2 applied, 1 rejected: package.json PERSISTENCE_PATH' });
+    expect(streamed.line).toBe('0 applied, 1 rejected: package.json PERSISTENCE_PATH');
+    expect(JSON.parse(frames.find((f) => f.event === 'ready')!.data)).toEqual({ replayed: 1, replayedFileChanges: 1 });
+    // File changes are not tool calls.
+    expect(JSON.parse(frames.filter((f) => f.event === 'counts').at(-1)!.data)).toEqual({
+      inspected: 1,
+      allowed: 1,
+      denied: 0,
+    });
+  });
+
+  it('serves a page that renders file-change lines', async () => {
+    const page = await (await fetch(await start(quietBus()))).text();
+    expect(page).toContain("addEventListener('filechanges'");
+    expect(page).not.toMatch(/\.innerHTML\b/);
   });
 
   it('unsubscribes from the bus when a client disconnects', async () => {
