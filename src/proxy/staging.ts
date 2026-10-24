@@ -52,6 +52,18 @@ export class StagingError extends Error {
   readonly code = 'STAGING_ERROR';
 }
 
+/** apply() failed after it had already changed some project paths; `applied` lists them. */
+export class StagingApplyError extends StagingError {
+  override name = 'StagingApplyError';
+
+  constructor(
+    readonly applied: readonly string[],
+    options?: ErrorOptions,
+  ) {
+    super('apply failed partway; some changes were already applied', options);
+  }
+}
+
 export type EntryType = 'file' | 'dir' | 'symlink' | 'special';
 
 export interface ManifestEntry {
@@ -426,24 +438,33 @@ export class StagingArea {
     }
 
     // Phase 2: deletes deepest first (so a directory can become a file), then writes in path order.
-    for (const d of deletes.sort((a, b) => (a.rel < b.rel ? 1 : -1))) {
-      const blocked = await this.checkProjectPath(d.rel, d.abs, projectAtSync);
-      if (blocked) {
-        results[d.index] = { path: changes[d.index]!.path, applied: false, ruleId: blocked };
-        continue;
+    // A failure here throws StagingApplyError naming what was already applied.
+    const applied: string[] = [];
+    try {
+      for (const d of deletes.sort((a, b) => (a.rel < b.rel ? 1 : -1))) {
+        const blocked = await this.checkProjectPath(d.rel, d.abs, projectAtSync);
+        if (blocked) {
+          results[d.index] = { path: changes[d.index]!.path, applied: false, ruleId: blocked };
+          continue;
+        }
+        if (await lstatIfPresent(d.abs)) await unlink(d.abs);
+        applied.push(changes[d.index]!.path);
+        await this.pruneEmptyProjectDirs(d.rel, after);
+        results[d.index] = { path: changes[d.index]!.path, applied: true, ruleId: decisions[d.index]!.ruleId };
       }
-      if (await lstatIfPresent(d.abs)) await unlink(d.abs);
-      await this.pruneEmptyProjectDirs(d.rel, after);
-      results[d.index] = { path: changes[d.index]!.path, applied: true, ruleId: decisions[d.index]!.ruleId };
-    }
-    for (const w of writes.sort((a, b) => (a.rel < b.rel ? -1 : 1))) {
-      const blocked = await this.checkProjectPath(w.rel, w.abs, projectAtSync);
-      if (blocked) {
-        results[w.index] = { path: changes[w.index]!.path, applied: false, ruleId: blocked };
-        continue;
+      for (const w of writes.sort((a, b) => (a.rel < b.rel ? -1 : 1))) {
+        const blocked = await this.checkProjectPath(w.rel, w.abs, projectAtSync);
+        if (blocked) {
+          results[w.index] = { path: changes[w.index]!.path, applied: false, ruleId: blocked };
+          continue;
+        }
+        await this.writeProjectFile(w.abs, w.content, w.executable);
+        applied.push(changes[w.index]!.path);
+        results[w.index] = { path: changes[w.index]!.path, applied: true, ruleId: decisions[w.index]!.ruleId };
       }
-      await this.writeProjectFile(w.abs, w.content, w.executable);
-      results[w.index] = { path: changes[w.index]!.path, applied: true, ruleId: decisions[w.index]!.ruleId };
+    } catch (err) {
+      if (applied.length === 0) throw err;
+      throw new StagingApplyError(applied, { cause: err });
     }
     return results;
   }

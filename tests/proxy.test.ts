@@ -9,15 +9,19 @@
  * 4. CLI with Kritish's demo/mock-server.ts as the downstream, the shipped config/firewall.yaml
  *    policy and Winston's real evaluator (read-only use of demo/* and src/security/*).
  * 5. Vertical slice: CLI → interceptor → publishEvent → event bus → monitor SSE on a free port.
+ * 6. Staged writes: interceptor + src/proxy/staged-call.ts + a real StagingArea, with
+ *    tests/fixtures/malicious-server.ts as a local stdio process rooted at the staging dir
+ *    (no Docker). Everything lives in mkdtemp dirs.
  */
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { InMemoryTransport, SdkError, SdkErrorCode, type CallToolResult } from '@modelcontextprotocol/server';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config/load.js';
 import { DUMMY_SECRET as MOCK_DUMMY_SECRET, MOCK_TOOL_NAMES, type MockToolName } from '../demo/mock-server.js';
 import {
@@ -30,12 +34,26 @@ import {
   type InterceptorDeps,
 } from '../src/proxy/interceptor.js';
 import { startProxyServer, type ProxyServerHandle } from '../src/proxy/server.js';
+import {
+  REJECTED_CHANGES_PREFIX,
+  STAGED_META_KEY,
+  STAGING_ERROR_PREFIX,
+  initStaging,
+  type StagedMeta,
+  type StagingAreaLike,
+  type StagingDeps,
+} from '../src/proxy/staged-call.js';
+import { StagingLock, createStagingArea, snapshot, type StagingArea } from '../src/proxy/staging.js';
+import { evaluateFileChangesStub } from '../src/proxy/stubs/evaluate-file-changes.stub.js';
 import { UpstreamUnavailableError, connectUpstream, type UpstreamConnection } from '../src/proxy/upstream.js';
 import {
   FirewallEventSchema,
   LIMITS,
   toCanonicalToolName,
+  type ChangeDecision,
+  type EvaluateFileChanges,
   type EvaluateToolCall,
+  type FileChangeEvent,
   type FirewallEvent,
   type FirewallPolicy,
   type PolicyDecision,
@@ -926,5 +944,506 @@ describe('proxy / vertical slice: CLI → monitor SSE', () => {
     // T11: nothing from the arguments or the mock's secret reaches the stream.
     const raw = JSON.stringify(sse);
     for (const value of ['README.md', 'credentials', ARG_SECRET, MOCK_DUMMY_SECRET]) expect(raw).not.toContain(value);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Staged writes: interceptor → staged-call → StagingArea, malicious fixture rooted at staging
+// ---------------------------------------------------------------------------
+
+const maliciousPath = resolve(import.meta.dirname, 'fixtures/malicious-server.ts');
+/** Same value as DUMMY_AWS_KEY in the fixture (not imported: importing would start that server). */
+const DUMMY_AWS_KEY = 'AKIAIOSFODNN7EXAMPLE';
+
+const PROJECT_FILES: Record<string, string> = {
+  'README.md': '# Demo project\n',
+  LICENSE: 'MIT\n',
+  'docs/guide.md': 'guide\n',
+  'src/app.ts': 'export const app = 1;\n',
+  'src/run.sh': 'echo run\n',
+};
+
+async function makeProject(root: string): Promise<void> {
+  for (const [rel, content] of Object.entries(PROJECT_FILES)) {
+    await mkdir(join(root, rel, '..'), { recursive: true });
+    await writeFile(join(root, rel), content);
+  }
+  await chmod(join(root, 'src/run.sh'), 0o644);
+}
+
+/** type, mode, content hash or link target per path. Excludes (.git/, .env…) are not listed. */
+async function fingerprint(root: string, withMode = true): Promise<Record<string, string>> {
+  return fingerprintOf(await snapshot(root), withMode);
+}
+
+function fingerprintOf(manifest: Map<string, { type: string; mode: number; sha256?: string; linkTarget?: string }>, withMode = true): Record<string, string> {
+  return Object.fromEntries(
+    [...manifest].map(([p, e]) => [p, `${e.type}:${e.sha256 ?? e.linkTarget ?? ''}${withMode && e.type !== 'dir' ? `:${e.mode.toString(8)}` : ''}`]),
+  );
+}
+
+async function exists(path: string): Promise<boolean> {
+  return lstat(path).then(
+    () => true,
+    () => false,
+  );
+}
+
+/** Argument policy for the staged tests: everything is allowed except paths under .git. */
+const stagedArgEvaluator: EvaluateToolCall = (ctx) =>
+  typeof ctx.arguments.path === 'string' && ctx.arguments.path.startsWith('.git')
+    ? { decision: 'DENY', ruleId: 'PROTECTED_PATH', reason: 'Path is protected' }
+    : ALLOW;
+
+/** Stand-in for Winston's evaluateFileChanges, so these tests check plumbing, not his rules. */
+const testChangeEvaluator: EvaluateFileChanges = (changes) =>
+  changes.map((c): ChangeDecision => {
+    const d = (decision: 'ALLOW' | 'DENY', ruleId: ChangeDecision['ruleId']): ChangeDecision => ({
+      path: c.path,
+      decision,
+      ruleId,
+      reason: 'test rule',
+    });
+    if (c.path.startsWith('.git/') || c.path.startsWith('.husky/')) return d('DENY', 'PERSISTENCE_PATH');
+    if (c.kind === 'symlink') return d('DENY', 'SYMLINK_DENIED');
+    if (c.kind === 'special') return d('DENY', 'WRITE_NOT_ALLOWED');
+    if (c.executable === true) return d('DENY', 'EXECUTABLE_DENIED');
+    if (c.path !== 'README.md' && !c.path.startsWith('src/')) return d('DENY', 'WRITE_NOT_ALLOWED');
+    if (typeof c.text === 'string' && /AKIA[0-9A-Z]{16}/.test(c.text)) return d('DENY', 'SECRET_DETECTED');
+    return d('ALLOW', 'APPROVED_TOOL');
+  });
+
+interface StagedOptions {
+  /** 'default' leaves evaluateFileChanges out of StagingDeps (the reject-all stub). */
+  changeEvaluator?: EvaluateFileChanges | 'default';
+  timeoutMs?: number;
+  startupTamper?: boolean;
+  wrapArea?: (area: StagingArea) => StagingAreaLike;
+  /** Replaces the forward to the fixture (it still runs inside staging). */
+  forward?: InterceptorDeps['forward'];
+  onFileChangeEvent?: (event: FileChangeEvent) => void;
+  /** false: skip initStaging. */
+  init?: boolean;
+}
+
+interface StagedStack {
+  dir: string;
+  project: string;
+  area: StagingArea;
+  staging: StagingDeps;
+  upstream: UpstreamConnection;
+  handler: ReturnType<typeof createInterceptor>;
+  fileEvents: FileChangeEvent[];
+  events: FirewallEvent[];
+  logs: string[];
+  initial: Awaited<ReturnType<StagingArea['sync']>>;
+  close(): Promise<void>;
+}
+
+async function startStaged(options: StagedOptions = {}): Promise<StagedStack> {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'mcp-firewall-staged-')));
+  const project = join(dir, 'project');
+  await makeProject(project);
+  const area = await createStagingArea({ projectRoot: project, stagingParent: dir, maxFileBytes: 64 * 1024 });
+  const initial = await area.sync();
+  const upstream = await connectUpstream(
+    { id: 'mal', command: 'unused', args: [], timeoutMs: options.timeoutMs ?? 10_000 },
+    {
+      launch: {
+        mode: 'local',
+        command: process.execPath,
+        args: ['--import', 'tsx', maliciousPath, '--root', area.stagingRoot],
+        cwd: repoRoot,
+        ...(options.startupTamper ? { env: { MALICIOUS_STARTUP: '1' } } : {}),
+      },
+    },
+  );
+  const fileEvents: FileChangeEvent[] = [];
+  const events: FirewallEvent[] = [];
+  const logs: string[] = [];
+  const changeEvaluator = options.changeEvaluator ?? testChangeEvaluator;
+  const staging: StagingDeps = {
+    area: options.wrapArea ? options.wrapArea(area) : area,
+    lock: new StagingLock(),
+    ...(changeEvaluator === 'default' ? {} : { evaluateFileChanges: changeEvaluator }),
+    policy: fixturePolicy,
+    onFileChangeEvent: options.onFileChangeEvent ?? ((e) => fileEvents.push(e)),
+  };
+  if (options.init !== false) await initStaging(staging, { serverId: 'mal', initial, log: (l) => logs.push(l) });
+  const handler = createInterceptor({
+    serverId: 'mal',
+    policy: fixturePolicy,
+    evaluate: stagedArgEvaluator,
+    publish: (e) => events.push(e),
+    forward: options.forward ?? ((name, args, o) => upstream.callTool(name, args, o)),
+    log: (line) => logs.push(line),
+    staging,
+  });
+  return {
+    dir,
+    project,
+    area,
+    staging,
+    upstream,
+    handler,
+    fileEvents,
+    events,
+    logs,
+    initial,
+    async close() {
+      await upstream.close().catch(() => {});
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+function stagedOf(result: CallToolResult): StagedMeta | undefined {
+  return result._meta?.[STAGED_META_KEY] as StagedMeta | undefined;
+}
+
+function allText(result: CallToolResult): string {
+  return result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+}
+
+/** Wraps a StagingArea, counting calls and optionally replacing methods. */
+function wrapped(area: StagingArea, calls: string[], override: Partial<StagingAreaLike> = {}): StagingAreaLike {
+  return {
+    sync: () => (calls.push('sync'), override.sync ? override.sync() : area.sync()),
+    diff: (before) => (calls.push('diff'), override.diff ? override.diff(before) : area.diff(before)),
+    apply: (c, d, p) => (calls.push('apply'), override.apply ? override.apply(c, d, p) : area.apply(c, d, p)),
+    revert: (paths) => (calls.push('revert'), override.revert ? override.revert(paths) : area.revert(paths)),
+  };
+}
+
+describe('proxy / staged writes', () => {
+  let stack: StagedStack | undefined;
+  afterEach(async () => {
+    await stack?.close();
+    stack = undefined;
+  });
+
+  it('1. baseline without staging: format_readme damages the real project', async () => {
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'mcp-firewall-unstaged-')));
+    const project = join(dir, 'project');
+    await makeProject(project);
+    const upstream = await connectUpstream(
+      { id: 'mal', command: 'unused', args: [], timeoutMs: 10_000 },
+      { launch: { mode: 'local', command: process.execPath, args: ['--import', 'tsx', maliciousPath, '--root', project], cwd: repoRoot } },
+    );
+    try {
+      const handler = createInterceptor({
+        serverId: 'mal',
+        policy: fixturePolicy,
+        evaluate: stagedArgEvaluator,
+        publish: () => {},
+        forward: (name, args, o) => upstream.callTool(name, args, o),
+        log: () => {},
+      });
+      const result = await handler('format_readme', {});
+      expect(textOf(result)).toBe('README formatted');
+      expect(stagedOf(result)).toBeUndefined();
+      expect(await exists(join(project, '.git/hooks/pre-commit'))).toBe(true);
+      expect(await exists(join(project, '.husky/pre-commit'))).toBe(true);
+      expect(await exists(join(project, 'LICENSE'))).toBe(false);
+      expect(await readFile(join(project, 'src/config.ts'), 'utf8')).toContain(DUMMY_AWS_KEY);
+      expect((await lstat(join(project, 'src/passwd-link'))).isSymbolicLink()).toBe(true);
+    } finally {
+      await upstream.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('2. an allowed write lands in the real project; the downstream result is passed through with _meta', async () => {
+    stack = await startStaged();
+    const result = await stack.handler('write_file', { path: 'src/new.ts', content: 'export const n = 1;\n' });
+    expect(result.content).toEqual([{ type: 'text', text: 'wrote src/new.ts' }]);
+    expect(result.isError).toBeFalsy();
+    expect(stagedOf(result)).toEqual({
+      applied: 1,
+      rejected: 0,
+      changes: [{ path: 'src/new.ts', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' }],
+    });
+    expect(await readFile(join(stack.project, 'src/new.ts'), 'utf8')).toBe('export const n = 1;\n');
+    expect(stack.fileEvents).toHaveLength(1);
+    expect(stack.fileEvents[0]).toMatchObject({ serverId: 'mal', toolName: 'write_file', applied: 1, rejected: 0 });
+  });
+
+  it('3. format_readme: only the README edit is applied; every other change is rejected and reverted', async () => {
+    stack = await startStaged();
+    const before = await fingerprint(stack.project);
+    const result = await stack.handler('format_readme', {});
+
+    expect(stagedOf(result)).toEqual({
+      applied: 1,
+      rejected: 5,
+      changes: [
+        { path: '.husky/pre-commit', decision: 'DENY', ruleId: 'PERSISTENCE_PATH' },
+        { path: 'LICENSE', decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' },
+        { path: 'README.md', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' },
+        { path: 'src/config.ts', decision: 'DENY', ruleId: 'SECRET_DETECTED' },
+        { path: 'src/passwd-link', decision: 'DENY', ruleId: 'SYMLINK_DENIED' },
+        { path: 'src/run.sh', decision: 'DENY', ruleId: 'EXECUTABLE_DENIED' },
+      ],
+    });
+    // .git/ is excluded from staging, so the .git hook is never diffed, applied or reported.
+    expect(await exists(join(stack.project, '.git'))).toBe(false);
+
+    const after = await fingerprint(stack.project);
+    expect(await readFile(join(stack.project, 'README.md'), 'utf8')).toBe('# Demo project\n\nFormatted.\n');
+    expect({ ...after, 'README.md': undefined }).toEqual({ ...before, 'README.md': undefined });
+
+    expect(await fingerprint(stack.area.stagingRoot, false)).toEqual(await fingerprint(stack.project, false));
+    expect(await exists(join(stack.area.stagingRoot, '.git'))).toBe(false);
+
+    expect(result.content[0]).toEqual({ type: 'text', text: 'README formatted' });
+    const note = result.content[1];
+    expect(note?.type === 'text' && note.text.startsWith(REJECTED_CHANGES_PREFIX)).toBe(true);
+    expect(allText(result)).toContain('.husky/pre-commit (PERSISTENCE_PATH)');
+    expect(allText(result)).toContain('src/config.ts (SECRET_DETECTED)');
+    expect(allText(result)).not.toContain(DUMMY_AWS_KEY);
+    expect(allText(result)).not.toContain('curl');
+  });
+
+  it('4. an argument DENY never forwards, never syncs and emits no FileChangeEvent', async () => {
+    const calls: string[] = [];
+    stack = await startStaged({ wrapArea: (a) => wrapped(a, calls) });
+    calls.length = 0;
+    const result = await stack.handler('write_file', { path: '.git/config', content: 'x' });
+    expect(textOf(result).startsWith(`${BLOCKED_PREFIX} (PROTECTED_PATH)`)).toBe(true);
+    expect(stagedOf(result)).toBeUndefined();
+    expect(calls).toEqual([]);
+    expect(stack.fileEvents).toEqual([]);
+    expect(await counts(stack.upstream)).toEqual({});
+  });
+
+  it('5. initStaging reverts startup tampering and reports it; a failing initStaging throws', async () => {
+    stack = await startStaged({ startupTamper: true });
+    expect(await exists(join(stack.area.stagingRoot, 'src/startup-implant.ts'))).toBe(false);
+    expect(await exists(join(stack.project, 'src/startup-implant.ts'))).toBe(false);
+    expect(await fingerprint(stack.project)).toEqual(fingerprintOf(stack.initial.project));
+    expect(stack.fileEvents).toEqual([
+      {
+        timestamp: expect.any(String),
+        requestId: 'startup',
+        serverId: 'mal',
+        toolName: '<startup>',
+        applied: 0,
+        rejected: 1,
+        changes: [{ path: 'src/startup-implant.ts', decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' }],
+      },
+    ]);
+    // Staged calls work after init.
+    const result = await stack.handler('write_file', { path: 'src/ok.ts', content: 'ok\n' });
+    expect(stagedOf(result)?.applied).toBe(1);
+
+    const broken: StagingDeps = {
+      ...stack.staging,
+      area: wrapped(stack.area, [], {
+        diff: async () => {
+          throw new Error('scan failed');
+        },
+      }),
+    };
+    await expect(initStaging(broken, { serverId: 'mal', initial: stack.initial, log: () => {} })).rejects.toThrow(
+      'scan failed',
+    );
+  });
+
+  it('refuses staged calls until initStaging has run', async () => {
+    stack = await startStaged({ init: false });
+    const result = await stack.handler('write_file', { path: 'src/a.ts', content: 'a' });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toMatch(new RegExp(`^\\${STAGING_ERROR_PREFIX}: staging is not initialized`));
+    expect(await counts(stack.upstream)).toEqual({});
+  });
+
+  it('6. WRITE_CONFLICT: a project file changed during evaluation keeps the user version', async () => {
+    let project = '';
+    stack = await startStaged({
+      changeEvaluator: (changes, p) => {
+        writeFileSync(join(project, 'README.md'), 'edited by the user\n');
+        return testChangeEvaluator(changes, p);
+      },
+    });
+    project = stack.project;
+    const result = await stack.handler('write_file', { path: 'README.md', content: 'from the server\n' });
+    expect(stagedOf(result)).toEqual({
+      applied: 0,
+      rejected: 1,
+      changes: [{ path: 'README.md', decision: 'DENY', ruleId: 'WRITE_CONFLICT' }],
+    });
+    expect(await readFile(join(stack.project, 'README.md'), 'utf8')).toBe('edited by the user\n');
+    expect(await readFile(join(stack.area.stagingRoot, 'README.md'), 'utf8')).toBe('edited by the user\n');
+  });
+
+  it('7. late writes are caught by the next call and policy-checked', async () => {
+    stack = await startStaged();
+    const first = await stack.handler('late_write', { delayMs: 150 });
+    expect(stagedOf(first)).toEqual({ applied: 0, rejected: 0, changes: [] });
+    expect(stack.fileEvents).toEqual([]);
+    await new Promise((r) => setTimeout(r, 500));
+
+    const second = await stack.handler('write_file', { path: 'src/next.ts', content: 'next\n' });
+    expect(stagedOf(second)?.changes).toEqual([{ path: 'src/next.ts', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' }]);
+    expect(stack.fileEvents.map((e) => [e.toolName, e.changes])).toEqual([
+      [
+        '<late-writes>',
+        [
+          { path: '.husky/late', decision: 'DENY', ruleId: 'PERSISTENCE_PATH' },
+          { path: 'src/late.ts', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' },
+        ],
+      ],
+      ['write_file', [{ path: 'src/next.ts', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' }]],
+    ]);
+    expect(stack.fileEvents[0]?.requestId).toMatch(/:late$/);
+    expect(await readFile(join(stack.project, 'src/late.ts'), 'utf8')).toBe('export const late = true;\n');
+    expect(await exists(join(stack.project, '.husky/late'))).toBe(false);
+    expect(await exists(join(stack.area.stagingRoot, '.husky/late'))).toBe(false);
+  });
+
+  it('8. a timed-out call is still diffed, and the lock is released for the next call', async () => {
+    stack = await startStaged({ timeoutMs: 1_000 });
+    const result = await stack.handler('hang', {});
+    expect(textOf(result).startsWith(DOWNSTREAM_ERROR_PREFIX)).toBe(true);
+    expect(metaOf(result)?.downstreamError).toBe('timeout');
+    expect(stagedOf(result)?.changes).toEqual([{ path: 'src/before-hang.ts', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' }]);
+    expect(await exists(join(stack.project, 'src/before-hang.ts'))).toBe(true);
+
+    const next = await stack.handler('write_file', { path: 'src/after.ts', content: 'after\n' });
+    expect(stagedOf(next)?.applied).toBe(1);
+  });
+
+  it('9. a downstream tool error is still diffed', async () => {
+    stack = await startStaged();
+    const result = await stack.handler('fail_after_write', {});
+    expect(result.isError).toBe(true);
+    expect(stagedOf(result)?.changes).toEqual([{ path: 'src/partial.ts', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' }]);
+    expect(await exists(join(stack.project, 'src/partial.ts'))).toBe(true);
+  });
+
+  it('10. a throwing staging area fails closed: nothing applied, later allowed calls refused unforwarded', async () => {
+    stack = await startStaged({
+      wrapArea: (a) =>
+        wrapped(a, [], {
+          apply: async () => {
+            throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+          },
+        }),
+    });
+    const before = await fingerprint(stack.project);
+    const result = await stack.handler('write_file', { path: 'src/x.ts', content: 'x\n' });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toMatch(new RegExp(`^\\${STAGING_ERROR_PREFIX}: staging failed and file changes were not applied`));
+    expect(stagedOf(result)).toBeUndefined();
+    expect(await fingerprint(stack.project)).toEqual(before);
+    expect(stack.logs.some((l) => l.includes('staging failed: Error code=ENOSPC'))).toBe(true);
+
+    const next = await stack.handler('write_file', { path: 'src/y.ts', content: 'y\n' });
+    expect(textOf(next)).toMatch(new RegExp(`^\\${STAGING_ERROR_PREFIX}: staging failed earlier`));
+    expect(textOf(next)).toContain('The request was not sent to the tool server');
+    expect(await counts(stack.upstream)).toEqual({ write_file: 1 });
+  });
+
+  it('reports the paths an apply had already written when it fails partway', async () => {
+    let stagingRoot = '';
+    stack = await startStaged({
+      changeEvaluator: (changes) =>
+        changes.map((c) => ({
+          path: c.path,
+          decision: c.kind === 'delete' ? 'DENY' : 'ALLOW',
+          ruleId: c.kind === 'delete' ? 'WRITE_NOT_ALLOWED' : 'APPROVED_TOOL',
+          reason: 'test',
+        })),
+      // Stands in for the server: edits README.md and replaces the docs/ directory with a file.
+      forward: async () => {
+        await writeFile(join(stagingRoot, 'README.md'), 'edited\n');
+        await rm(join(stagingRoot, 'docs'), { recursive: true });
+        await writeFile(join(stagingRoot, 'docs'), 'now a file\n');
+        return OK_RESULT;
+      },
+    });
+    stagingRoot = stack.area.stagingRoot;
+    const result = await stack.handler('anything', {});
+    expect(textOf(result)).toContain('except these, applied before the failure: README.md');
+    expect(stack.logs.some((l) => l.includes('StagingApplyError') && l.includes('already applied before the failure: README.md'))).toBe(true);
+    expect(await readFile(join(stack.project, 'README.md'), 'utf8')).toBe('edited\n');
+    expect(await readFile(join(stack.project, 'docs/guide.md'), 'utf8')).toBe('guide\n');
+  });
+
+  it('11. an evaluator that throws or returns the wrong length rejects every change', async () => {
+    for (const changeEvaluator of [
+      (): ChangeDecision[] => {
+        throw new Error('rules exploded');
+      },
+      (): ChangeDecision[] => [],
+    ]) {
+      stack = await startStaged({ changeEvaluator });
+      const result = await stack.handler('write_file', { path: 'src/a.ts', content: 'a\n' });
+      expect(stagedOf(result)).toEqual({
+        applied: 0,
+        rejected: 1,
+        changes: [{ path: 'src/a.ts', decision: 'DENY', ruleId: 'EVALUATION_ERROR' }],
+      });
+      expect(await exists(join(stack.project, 'src/a.ts'))).toBe(false);
+      expect(await exists(join(stack.area.stagingRoot, 'src/a.ts'))).toBe(false);
+      await stack.close();
+      stack = undefined;
+    }
+  });
+
+  it('the default evaluator (reject-all stub) rejects every change', async () => {
+    expect(evaluateFileChangesStub([{ path: 'a', kind: 'add' }], fixturePolicy)[0]?.ruleId).toBe('WRITE_NOT_ALLOWED');
+    stack = await startStaged({ changeEvaluator: 'default' });
+    const result = await stack.handler('write_file', { path: 'src/a.ts', content: 'a\n' });
+    expect(stagedOf(result)?.changes).toEqual([{ path: 'src/a.ts', decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' }]);
+    expect(await exists(join(stack.project, 'src/a.ts'))).toBe(false);
+  });
+
+  it('12. concurrent allowed calls are serialized', async () => {
+    const log: string[] = [];
+    let upstream: UpstreamConnection | undefined;
+    stack = await startStaged({
+      forward: async (name, args, o) => {
+        log.push(`start ${String(args.path)}`);
+        const r = await upstream!.callTool(name, args, o);
+        await new Promise((res) => setTimeout(res, 50));
+        log.push(`end ${String(args.path)}`);
+        return r;
+      },
+    });
+    upstream = stack.upstream;
+    const [a, b] = await Promise.all([
+      stack.handler('write_file', { path: 'src/a.ts', content: 'a\n' }),
+      stack.handler('write_file', { path: 'src/b.ts', content: 'b\n' }),
+    ]);
+    expect(log).toEqual(['start src/a.ts', 'end src/a.ts', 'start src/b.ts', 'end src/b.ts']);
+    expect(stagedOf(a)?.changes.map((c) => c.path)).toEqual(['src/a.ts']);
+    expect(stagedOf(b)?.changes.map((c) => c.path)).toEqual(['src/b.ts']);
+  });
+
+  it('13. a throwing onFileChangeEvent does not change the result', async () => {
+    stack = await startStaged({
+      onFileChangeEvent: () => {
+        throw new Error('monitor down');
+      },
+    });
+    const result = await stack.handler('write_file', { path: 'src/a.ts', content: 'a\n' });
+    expect(result.isError).toBeFalsy();
+    expect(stagedOf(result)?.applied).toBe(1);
+    expect(stack.logs.some((l) => l.includes('file change event callback failed'))).toBe(true);
+  });
+
+  it('14. FileChangeEvents carry no contents and at most 20 changes', async () => {
+    stack = await startStaged();
+    const result = await stack.handler('write_many', { count: 25 });
+    expect(stagedOf(result)).toMatchObject({ applied: 13, rejected: 12 });
+    expect(stagedOf(result)?.changes).toHaveLength(25);
+    const [event] = stack.fileEvents;
+    expect(event).toMatchObject({ applied: 13, rejected: 12 });
+    expect(event?.changes).toHaveLength(20);
+    const raw = JSON.stringify(stack.fileEvents);
+    expect(raw).not.toContain(DUMMY_AWS_KEY);
+    expect(raw).not.toContain('"text"');
+    expect(raw).not.toContain('export const');
   });
 });

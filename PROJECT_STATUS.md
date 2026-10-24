@@ -1,10 +1,17 @@
 # Project status: proxy and enforcement (Aarav)
 
-Merged to `main` (PRs #2, #7, #9, #10, #11). In progress on `aarav/docker-upstream`: Docker launch mode in `src/proxy/upstream.ts` (not yet merged). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
+Merged to `main` (PRs #2, #7, #9, #10, #11, #12). In progress on `aarav/interceptor-staging`: staged writes in the interceptor (not yet merged). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ## Done
 
 - **`src/proxy/interceptor.ts`**: `createInterceptor(deps)` does validate → clone + deep-freeze → evaluate (schema-checked, fail closed) → publish exactly one event → forward only on ALLOW. It returns a recognizable BLOCKED tool error on DENY and a fixed-message DOWNSTREAM ERROR when the downstream fails.
+  - **Staged writes** (on `aarav/interceptor-staging`): the optional `staging` dep `{ area, lock, evaluateFileChanges?, policy, onFileChangeEvent? }` sends every ALLOWed call through `runStagedCall` in the new **`src/proxy/staged-call.ts`**. Without it, behavior is unchanged and every earlier test passes as before.
+  - Per call, under the `StagingLock`: a catch-up diff for late writes (reported as `<late-writes>`, request `<id>:late`), then sync, forward, and a diff that runs even after an error or timeout. Then `evaluateFileChanges` (output validated; if it throws or the output is malformed, every change is DENY / `EVALUATION_ERROR`), apply, revert of rejected changes, and a sync that sets the next baseline.
+  - The result keeps the downstream content and gets `_meta['mcp-firewall/staged'] = { applied, rejected, changes }`. If anything was rejected, a note listing the rejected paths and rule IDs is appended (`REJECTED_CHANGES_PREFIX`). A `FileChangeEvent` is emitted when there were changes: at most 20 entries, bounded paths, no `text`, and callback errors are only logged.
+  - **Fail closed:** any sync/diff/apply/revert error returns a `STAGING_ERROR_PREFIX` tool error (naming paths already applied, via the new `StagingApplyError` in `staging.ts`) and breaks staging. Every later allowed call is refused without forwarding until restart, and so are calls before `initStaging()` has run.
+  - `initStaging(staging, { serverId, initial })` reverts changes the server made before any call, emits a `<startup>` event (WRITE_NOT_ALLOWED, "change made before any tool call"), and throws if staging fails.
+  - The interceptor branches on `decision` only. See [DECISIONS §12](docs/DECISIONS.md).
+  - **Change evaluator:** `src/security/changes.ts` is not on `main` yet, so the default is the existing reject-all stub `src/proxy/stubs/evaluate-file-changes.stub.ts` (now with a TODO to swap it). No second stub was added.
 - **`src/proxy/upstream.ts`**: `connectUpstream(config, { onClose? })` spawns the server over stdio with a safe default env and re-emits its stderr with a prefix. It has a connect timeout, per-call `timeout`/`maxTotalTimeout`/`signal`, paginated `listTools` (20-page cap), a `connected` getter, and `UpstreamUnavailableError` once closed. No reconnect.
   - **Docker launch mode** (on `aarav/docker-upstream`): `connectUpstream(server, { launch })` takes an exported, Zod-validated `UpstreamLaunch`. It is either `{ mode: 'local', command, args, env?, cwd? }` (the old behavior, built by `localLaunch(server)`) or `{ mode: 'docker', image, command, args, workspaceDir, serverDir?, env?, user?, memory?, pidsLimit? }`.
   - Docker mode runs the plan's locked-down container: `--network none --read-only --cap-drop ALL --security-opt no-new-privileges`, host `uid:gid`, pids 128, 512m, tmpfs `/tmp`, staging rw at `/workspace`, server code ro at `/server`, and only explicit `-e` vars. `buildDockerArgs(launch)` builds the argv. It is exported, unit-tested and never uses a shell.
@@ -24,8 +31,9 @@ Merged to `main` (PRs #2, #7, #9, #10, #11). In progress on `aarav/docker-upstre
   - `revert(paths)`: restores those paths in staging from the project.
 
   Also exported: `snapshot(root)`, `resolveInRoot(root, rel)` (the single path-safety check) and `StagingLock` (async mutex for the interceptor). Every error is thrown to the caller, with no paths or contents in messages. Node built-ins only. See [DECISIONS §10](docs/DECISIONS.md).
+- **`tests/fixtures/malicious-server.ts`**: test-only stdio server rooted at `--root`. Tools: `write_file`, `format_readme` (README edit plus a `.git` hook, a `.husky` hook, a symlink, an exec bit, a dummy AWS key and a deleted `LICENSE`), `late_write`, `write_many`, `fail_after_write`, `hang`, `get_call_counts`. With `MALICIOUS_STARTUP=1` it writes a file before serving.
 - **`tests/staging.test.ts`**: 24 tests against real temp dirs: excludes, symlinks and hardlinks, text rules, path escapes, atomic apply, conflicts, defense in depth, revert, ordering and the lock.
-- **`tests/proxy.test.ts`**: 67 tests in tests/proxy.test.ts; full suite 186 passing (67 proxy, 28 contract, 14 security, 16 events, 8 monitor, 24 staging, 29 upstream-docker), 3 skipped (Docker integration), 8 todo (all in `tests/e2e.test.ts`). Coverage:
+- **`tests/proxy.test.ts`**: 84 tests in tests/proxy.test.ts (17 of them staged writes: cases 1–14 of the task plus init-required, partial apply and the reject-all stub); full suite 203 passing (84 proxy, 28 contract, 14 security, 16 events, 8 monitor, 24 staging, 29 upstream-docker), 3 skipped (Docker integration), 8 todo (all in `tests/e2e.test.ts`). Coverage:
   - unit tests (T01, T02, T06, T09, T11, fail-closed evaluator and publish, arg mutation, summary bounds, signal)
   - integration through the real stdio fixture (listing identical to direct, T01/T02 counts, structured results and tool errors, unknown tools, hang timeout, crash)
   - CLI smoke test of `src/index.ts`. With the real evaluator, its approved `fixture/echo` call now takes the forwarded (ALLOW) branch.
@@ -95,7 +103,7 @@ From `src/proxy/interceptor.ts`:
 
 - ~~`src/security/evaluator.ts` is the deny-all stub~~: Winston's real evaluator landed on `main` in PR #4 (`40ea8e4`). With the shipped policy it returns ALLOW / PROTECTED_PATH / DENIED_DESTINATION / DENIED_TOOL for the four demo calls, consistent with design §7.
 - ~~`demo/mock-server.ts` is a stub~~: landed in PR #3 (`6a7f51d`).
-- **Release gate (§10): all three commands pass** on this machine: `npm run typecheck`, `npm test` (186 passed, 3 skipped without Docker, 8 todo) and `npm run demo` (DEMO PASSED, all 12 checks).
+- **Release gate (§10): all three commands pass** on this machine: `npm run typecheck`, `npm test` (203 passed, 3 skipped without Docker, 8 todo) and `npm run demo` (DEMO PASSED, all 12 checks).
 - **Open policy issues for Winston** (found in a read-only review; no proxy change needed):
   - case-variant protected paths are allowed on macOS
   - relative-path traversal is not resolved
@@ -132,6 +140,14 @@ From `src/proxy/interceptor.ts`:
 6. **Staged writes:**
    - ~~Contract PR~~: merged (PR #10). See [DECISIONS §9](docs/DECISIONS.md).
    - ~~`src/proxy/staging.ts`~~: merged (PR #11).
-   - ~~Docker launch mode in upstream~~: built on `aarav/docker-upstream`. Its integration tests still need a run on a machine with Docker and `node:22-slim`.
-   - **Next: interceptor integration.** Take the `StagingLock`, then sync, forward, and diff after every allowed call (including timeout and error). Then `evaluateFileChanges` (the stub until Winston's lands), apply/revert, the result note, `_meta['mcp-firewall/staged']` and the `FileChangeEvent`. Fail closed on any staging error.
+   - ~~Docker launch mode in upstream~~: merged (PR #12). Its integration tests still need a run on a machine with Docker and `node:22-slim`.
+   - ~~Interceptor integration~~: built on `aarav/interceptor-staging`.
+   - **Next: `src/index.ts` wiring** (not done; out of scope for that branch). When the config has `server.sandbox` (Kritish's loader), index.ts must, in order:
+     1. `createStagingArea({ projectRoot, extraExcludes, maxFileBytes: policy.staging.maxFileBytes })`. Refuse to start if `policy.staging` is missing.
+     2. `initial = await area.sync()`
+     3. `connectUpstream(config.server, { launch: { mode: 'docker', workspaceDir: area.stagingRoot, … } })`
+     4. `await initStaging(staging, { serverId, initial })` (let it throw)
+     5. pass `staging` to `createInterceptor`, with `onFileChangeEvent` wired to the monitor (Kritish)
+     6. `area.dispose()` on shutdown
+   - Swap the reject-all stub for Winston's `evaluateFileChanges` once `src/security/changes.ts` lands.
 7. Optional, after acceptance tests: forward `list_changed`. Consider logging a clearer warning when the monitor port is taken, e.g. "events from this instance will not appear in the browser", and logging only the error code instead of the full `EADDRINUSE` object and stack.
