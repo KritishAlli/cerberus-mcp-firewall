@@ -14,6 +14,12 @@
  *   - FirewallConfig wraps policy + downstream server + monitor settings.
  *   - toCanonicalToolName() is the one place "serverId/toolName" is built.
  *   - EvaluateToolCall / PublishEvent are the cross-team function signatures.
+ *
+ * Staged writes (contract/staged-writes, agreed by all three; additive only):
+ *   - FileChange / ChangeDecision / StagingPolicy / FileChangeEvent and their schemas.
+ *   - FirewallPolicy gains an optional `staging` section.
+ *   - RuleId gains the staging rule IDs (WRITE_NOT_ALLOWED … WRITE_CONFLICT).
+ *   - EvaluateFileChanges is the Winston → Aarav signature for staged changes.
  */
 import { z } from 'zod';
 
@@ -29,6 +35,11 @@ export const LIMITS = {
   /** Max length of identifiers such as requestId, serverId, toolName. */
   identifier: 128,
 } as const;
+
+/** Max entries in FileChangeEvent.changes; the rest are only counted in applied / rejected. */
+export const MAX_FILE_CHANGE_EVENT_ENTRIES = 20;
+/** Max length of a path in FileChangeEvent.changes (the publisher truncates longer paths). */
+export const MAX_FILE_CHANGE_EVENT_PATH_LENGTH = 200;
 
 const identifier = z.string().min(1).max(LIMITS.identifier);
 
@@ -52,6 +63,21 @@ export const RULE_IDS = [
    * throws or the policy is unusable, so the call still fails closed (§5, §6.4).
    */
   'EVALUATION_ERROR',
+
+  // --- Staged writes (EvaluateFileChanges) ---------------------------------
+
+  /** Path is outside staging.writablePaths. */
+  'WRITE_NOT_ALLOWED',
+  /** Path is a persistence location (staging.protectedWritePaths: shell rc, hooks, CI, …). */
+  'PERSISTENCE_PATH',
+  'SYMLINK_DENIED',
+  'EXECUTABLE_DENIED',
+  /** FileChange.text matched a secret pattern. */
+  'SECRET_DETECTED',
+  /** More than staging.maxChangesPerCall changes, or a file over staging.maxFileBytes. */
+  'CHANGE_LIMIT',
+  /** The project file changed since the staging copy was taken. */
+  'WRITE_CONFLICT',
 ] as const;
 
 export const RuleIdSchema = z.enum(RULE_IDS);
@@ -104,6 +130,22 @@ export const FirewallEventSchema = z.strictObject({
 export type FirewallEvent = z.infer<typeof FirewallEventSchema>;
 
 // ---------------------------------------------------------------------------
+// StagingPolicy — FirewallPolicy.staging, for staged writes (see below)
+// ---------------------------------------------------------------------------
+
+export const StagingPolicySchema = z.strictObject({
+  /** Path patterns, relative to the project root, that changes may touch. */
+  writablePaths: z.array(z.string().min(1)),
+  /** Path patterns that are never written, even inside writablePaths (PERSISTENCE_PATH). */
+  protectedWritePaths: z.array(z.string().min(1)),
+  /** Larger files are denied (CHANGE_LIMIT) and never get FileChange.text. */
+  maxFileBytes: z.number().int().positive(),
+  /** A call with more changes than this has all of them denied (CHANGE_LIMIT). */
+  maxChangesPerCall: z.number().int().positive(),
+});
+export type StagingPolicy = z.infer<typeof StagingPolicySchema>;
+
+// ---------------------------------------------------------------------------
 // FirewallPolicy — semantics owned by Winston (§7)
 // ---------------------------------------------------------------------------
 
@@ -131,8 +173,89 @@ export const FirewallPolicySchema = z.strictObject({
   destinationArgs: z.record(z.string().min(1), z.array(z.string().min(1))).default({}),
   /** Canonical tool names treated as destructive (DESTRUCTIVE_ACTION). */
   destructiveTools: z.array(z.string().min(1)).default([]),
+
+  // --- Staged writes --------------------------------------------------------
+
+  /**
+   * Rules for applying changes the sandboxed downstream server made to its
+   * staging copy. Optional so existing configs keep loading. Sandbox mode
+   * refuses to start if it is missing: fail closed, never a permissive default.
+   */
+  staging: StagingPolicySchema.optional(),
 });
 export type FirewallPolicy = z.infer<typeof FirewallPolicySchema>;
+
+// ---------------------------------------------------------------------------
+// Staged writes — the sandboxed server writes to a staging copy; the proxy
+// diffs it after each allowed call and applies only approved changes.
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalized posix path relative to the project root: not absolute, no drive
+ * prefix, no backslashes or NULs, and no empty, "." or ".." segments.
+ */
+const ProjectRelativePathSchema = z
+  .string()
+  .min(1)
+  .refine((p) => !p.startsWith('/'), 'path must be relative to the project root')
+  .refine((p) => !/^[A-Za-z]:/.test(p), 'path must not have a drive prefix')
+  .refine((p) => !p.includes('\\'), 'path must use posix separators')
+  .refine((p) => !p.includes('\0'), 'path must not contain NUL')
+  .refine((p) => !p.split('/').includes(''), 'path must not contain empty segments')
+  .refine((p) => !p.split('/').includes('.'), 'path must not contain a "." segment')
+  .refine((p) => !p.split('/').includes('..'), 'path must not contain a ".." segment');
+
+export const FileChangeKindSchema = z.enum(['add', 'modify', 'delete', 'mode', 'symlink', 'special']);
+export type FileChangeKind = z.infer<typeof FileChangeKindSchema>;
+
+export const FileChangeSchema = z.strictObject({
+  /** Posix, relative to the project root, normalized. */
+  path: ProjectRelativePathSchema,
+  kind: FileChangeKindSchema,
+  size: z.number().int().nonnegative().optional(),
+  /** New or changed exec bit. */
+  executable: z.boolean().optional(),
+  /** Symlinks only. */
+  linkTarget: z.string().optional(),
+  /**
+   * Content of text files under staging.maxFileBytes, for secret scanning only.
+   * NEVER put it in logs, events, SSE or error messages.
+   */
+  text: z.string().nullable().optional(),
+});
+export type FileChange = z.infer<typeof FileChangeSchema>;
+
+/** Exactly one per input FileChange, in the same order. */
+export const ChangeDecisionSchema = z.strictObject({
+  path: ProjectRelativePathSchema,
+  decision: DecisionSchema,
+  ruleId: RuleIdSchema,
+  /** Safe to show the user. Never contains file contents. */
+  reason: z.string().min(1).max(LIMITS.reason),
+});
+export type ChangeDecision = z.infer<typeof ChangeDecisionSchema>;
+
+/** One per staged diff, published alongside the call's FirewallEvent. Never carries contents. */
+export const FileChangeEventSchema = z.strictObject({
+  /** ISO 8601. */
+  timestamp: z.iso.datetime(),
+  requestId: identifier,
+  serverId: identifier,
+  toolName: identifier,
+  applied: z.number().int().nonnegative(),
+  rejected: z.number().int().nonnegative(),
+  /** At most MAX_FILE_CHANGE_EVENT_ENTRIES entries; paths truncated, never contents. */
+  changes: z
+    .array(
+      z.strictObject({
+        path: z.string().min(1).max(MAX_FILE_CHANGE_EVENT_PATH_LENGTH),
+        decision: DecisionSchema,
+        ruleId: RuleIdSchema,
+      }),
+    )
+    .max(MAX_FILE_CHANGE_EVENT_ENTRIES),
+});
+export type FileChangeEvent = z.infer<typeof FileChangeEventSchema>;
 
 // ---------------------------------------------------------------------------
 // FirewallConfig — the whole YAML file (loader owned by Kritish)
@@ -184,6 +307,12 @@ export type EvaluateToolCall = (request: ToolCallContext, policy: FirewallPolicy
  * allow/deny result. Responsible for redaction before persisting/streaming.
  */
 export type PublishEvent = (event: FirewallEvent) => void;
+
+/**
+ * Winston → Aarav, implemented in src/security/changes.ts. Pure, synchronous,
+ * no I/O. Returns exactly one decision per input change, in the same order.
+ */
+export type EvaluateFileChanges = (changes: FileChange[], policy: FirewallPolicy) => ChangeDecision[];
 
 // ---------------------------------------------------------------------------
 // Shared helpers

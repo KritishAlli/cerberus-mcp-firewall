@@ -112,4 +112,5 @@ From `src/proxy/interceptor.ts`:
    - move "Claude Code setup (verified)" into the README and fix the stale status line
    - switch the demo's block detection to `_meta['mcp-firewall/decision']`
 5. ~~Shutdown hook for the monitor~~: already in place. `src/index.ts` closes it on shutdown, and port 3000 is freed after SIGINT.
-6. Optional, after acceptance tests: forward `list_changed`. Consider logging a clearer warning when the monitor port is taken, e.g. "events from this instance will not appear in the browser", and logging only the error code instead of the full `EADDRINUSE` object and stack.
+6. **Staged writes:** contract PR prepared on `contract/staged-writes` (`FileChange`, `ChangeDecision`, `StagingPolicy`, `FileChangeEvent`, `EvaluateFileChanges`, optional `policy.staging`, 7 staging rule IDs, and a reject-all stub in `src/proxy/stubs/`), pending team approval and merge. See [DECISIONS §9](docs/DECISIONS.md). Next: `src/proxy/staging.ts`.
+7. Optional, after acceptance tests: forward `list_changed`. Consider logging a clearer warning when the monitor port is taken, e.g. "events from this instance will not appear in the browser", and logging only the error code instead of the full `EADDRINUSE` object and stack.
