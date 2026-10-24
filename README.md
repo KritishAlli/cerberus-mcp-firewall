@@ -96,36 +96,6 @@ Cerberus guards **only MCP tool calls that pass through it**. It does **not** in
 
 It blocks policy-violating calls even when an indirect prompt injection caused them, but it doesn't necessarily detect the injected text. The monitor and the dialog are presentation surfaces, not the enforcement boundary. This is a prototype, not a complete security boundary: **use only dummy secrets.**
 
-## Ownership
-
-Edit only the files you own. Changes to **shared** files need a quick agreement from all three people.
-
-| Area | Files | Owner |
-| --- | --- | --- |
-| Contract | `src/shared/contracts.ts` | **Shared** |
-| Tooling | `package.json`, `package-lock.json`, `tsconfig.json`, `vitest.config.ts` | **Shared** |
-| Gateway, Docker, staging, client adapter | `src/proxy/*`, `src/index.ts`, `tests/proxy*.test.ts`, `tests/staging.test.ts`, `tests/upstream-docker.test.ts` | Aarav |
-| Policy and approval semantics | `src/security/*`, `tests/security*.test.ts`, `tests/approval.test.ts`, policy semantics in `config/*.yaml` | Winston |
-| Monitor, config loader, setup, demo, docs | `src/observability/*`, `src/config/*`, `demo/*`, `tests/e2e.test.ts`, `tests/monitor.test.ts`, `README.md`, `docs/cerberus.md`, `docs/SETUP.md` | Kritish |
-| Shared tests | `tests/firewall.test.ts`, `tests/events.test.ts`, `tests/fixtures/*` | **Shared** |
-
-### Git workflow
-
-- `main` always passes `npm run check`.
-- Each person works on their own branches (`aarav/…`, `winston/…`, `kritish/…`). Commit often and merge small.
-- Don't rewrite teammates' modules. Don't silently change request or event shapes.
-
-## Contract notes
-
-`src/shared/contracts.ts` implements design §5:
-
-- **Zod schemas are the source of truth.** Every type is `z.infer` of its schema, so validation and types can't drift apart.
-- **`RuleId` is a closed enum** (listed above). `EVALUATION_ERROR` is used by the proxy, never the evaluator, so a throwing evaluator still fails closed.
-- **`FirewallPolicy`** adds `pathArgs`, `destinationArgs`, `destructiveTools`, `writeTools`, `allowedRoots`, `allowedHosts` and `staging` (`writablePaths`, `protectedWritePaths`, `maxFileBytes`, `maxChangesPerCall`).
-- **`FirewallConfig`** wraps `server` (one downstream stdio server, with an optional `sandbox`), `monitor` (loopback host, port, ring-buffer size) and `policy`. Unknown keys are rejected.
-- **Canonical tool names** are always built with `toCanonicalToolName(serverId, toolName)`, giving e.g. `"fs/read_text_file"`.
-- **Cross-team signatures:** `EvaluateToolCall` and `EvaluateFileChanges` (Winston → Aarav), `PublishEvent` (Kritish → Aarav).
-
 ## Docs
 
 | Doc | Contents |
