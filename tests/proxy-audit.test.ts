@@ -693,8 +693,8 @@ describe('1g staged-call integration', () => {
   });
 
   // src/index.ts builds StagingDeps without evaluateFileChanges, so the runtime uses
-  // defaultEvaluateFileChanges = the reject-all stub. src/security has no evaluateFileChanges.
-  it.fails('GAP 1g: the runtime file-change evaluator ignores policy.staging (reject-all stub)', () => {
+  // defaultEvaluateFileChanges = src/security's evaluateFileChanges.
+  it('1g: the runtime file-change evaluator follows policy.staging', () => {
     const { policy: sandboxPolicy } = loadConfig(path.join(repoRoot, 'config/sandbox.yaml'));
     expect(sandboxPolicy.staging?.writablePaths).toContain('src/**');
     const change = { path: 'src/greet.js', kind: 'modify' } as FileChange;
