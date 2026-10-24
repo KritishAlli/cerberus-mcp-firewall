@@ -93,14 +93,33 @@ describe('createClientApproval', () => {
     const { client, asked } = fakeClient(() => ({ action: 'decline' }));
     const approval = createClientApproval({ log: () => {} });
     approval.attach(client);
-    await approval.policy('req-\u001b[31m1', 'fs/read_text_file', { ...deny, reason: 'bad‮reason' });
+    await approval.policy('req-1', 'fs/write_file', { ...deny, reason: 'bad‮reason' }, '/workspace/package.json');
     const [form] = asked;
     expect(form!.mode).toBe('form');
     expect(form!.requestedSchema.required).toEqual(['decision']);
     expect(form!.requestedSchema.properties.decision).toMatchObject({ default: 'block' });
-    expect(form!.message).toContain('PROTECTED_PATH');
-    expect(form!.message).toContain('fs/read_text_file');
+    expect(form!.message).toContain('Cerberus blocked write');
+    expect(form!.message).toContain('Target: package.json');
+    expect(form!.message).toContain('Reason: This project path is protected by policy.');
+    expect(form!.message).not.toContain('/workspace');
+    expect(form!.message).not.toContain('bad reason');
+    expect(form!.message).not.toContain('req-1');
+    expect(form!.message).not.toContain('DENY request');
+    expect(form!.requestedSchema.properties['decision']).toMatchObject({
+      title: 'Action',
+      oneOf: [
+        { const: 'block', title: 'Keep blocked (recommended)' },
+        { const: 'allow_once', title: 'Allow this call once' },
+      ],
+    });
     expect(form!.message.replace(/\n/g, '')).not.toMatch(/[\u0000-\u001f‮]/);
+
+    await approval.policy('req-2', 'fs/list_directory', {
+      decision: 'DENY', ruleId: 'PATH_NOT_ALLOWED', reason: 'Path is outside the configured allowed roots',
+    }, '/Users/winstonluo/private/src');
+    expect(asked[1]!.message).toContain('Target: outside the project');
+    expect(asked[1]!.message).toContain('Reason: This target is outside the project paths Cerberus allows.');
+    expect(asked[1]!.message).not.toContain('/Users/winstonluo');
   });
 
   it('uses the fallback before a client attaches and when it lacks form elicitation', async () => {
@@ -120,18 +139,39 @@ describe('createClientApproval', () => {
     expect(await createClientApproval({ log: () => {} }).policy('req-1', 'fs/x', deny)).toBe(false);
   });
 
-  it('lists rejected changes, and offers no override above the review limit', async () => {
+  it('shows sandbox denials and withholds overrides above the review limit', async () => {
     const { client, asked } = fakeClient(() => ({ action: 'accept', content: { decision: 'allow_once' } }));
     const approval = createClientApproval({ log: () => {} });
     approval.attach(client);
 
     const few = rejected(2);
     expect(await approval.changes('req-1', 'fs/write_file', few.changes, few.decisions)).toBe(true);
-    expect(asked[0]!.message).toContain('package-1.json (WRITE_NOT_ALLOWED, modify');
+    expect(asked[0]!.message).toContain('• package-1.json — protected write path (WRITE_NOT_ALLOWED; modify)');
 
     const many = rejected(MAX_REVIEW_ITEMS + 1);
     expect(await approval.changes('req-2', 'fs/write_file', many.changes, many.decisions)).toBe(false);
+    expect(asked).toHaveLength(2);
+    expect(asked[1]!.message).toContain('Cerberus sandbox blocked changes');
+    expect(asked[1]!.message).toContain('review limit');
+    expect(asked[1]!.requestedSchema.properties.decision).toMatchObject({ oneOf: [
+      { const: 'block', title: 'Keep changes blocked' },
+    ] });
+  });
+
+  it('shows hard sandbox denials without offering an override', async () => {
+    const { client, asked } = fakeClient(() => ({ action: 'accept', content: { decision: 'allow_once' } }));
+    const approval = createClientApproval({ log: () => {} });
+    approval.attach(client);
+    const item: FileChange = { path: 'src/large-test.txt', kind: 'add', size: 70_000, executable: false, text: null };
+    const decision: ChangeDecision = { path: item.path, decision: 'DENY', ruleId: 'CHANGE_LIMIT', reason: 'File exceeds the configured size limit' };
+    expect(await approval.changes('req-large', 'fs/write_file', [item], [decision], [])).toBe(false);
     expect(asked).toHaveLength(1);
+    expect(asked[0]!.message).toContain('Cerberus blocked sandbox changes');
+    expect(asked[0]!.message).toContain('src/large-test.txt');
+    expect(asked[0]!.message).toContain('CHANGE_LIMIT');
+    expect(asked[0]!.requestedSchema.properties.decision).toMatchObject({ oneOf: [
+      { const: 'block', title: 'Keep changes out (recommended)' },
+    ] });
   });
 
   it('asks one dialog at a time', async () => {

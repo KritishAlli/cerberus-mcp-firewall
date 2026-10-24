@@ -15,15 +15,20 @@ import type { ChangeDecision, FileChange, PolicyDecision } from '../shared/contr
 export const MAX_REVIEW_ITEMS = 12;
 
 export interface TerminalApproval {
-  policy(requestId: string, toolName: string, decision: PolicyDecision): Promise<boolean>;
-  changes(requestId: string, toolName: string, changes: readonly FileChange[], decisions: readonly ChangeDecision[]): Promise<boolean>;
+  policy(requestId: string, toolName: string, decision: PolicyDecision, target?: string): Promise<boolean>;
+  changes(requestId: string, toolName: string, changes: readonly FileChange[], decisions: readonly ChangeDecision[], overrideablePaths?: readonly string[]): Promise<boolean>;
 }
 
 /** One override question, already sanitized for display. */
 export interface ApprovalPrompt {
+  /** Kept in diagnostics for correlation; omitted from the user decision text. */
+  requestId: string;
   heading: string;
   detail: string;
   question: string;
+  blockLabel: string;
+  allowLabel: string;
+  allowOverride: boolean;
 }
 
 export interface TerminalApprovalOptions {
@@ -31,12 +36,45 @@ export interface TerminalApprovalOptions {
   interactive?: boolean;
 }
 
-export function describePolicyDeny(requestId: string, toolName: string, decision: PolicyDecision): ApprovalPrompt {
+export function describePolicyDeny(requestId: string, toolName: string, decision: PolicyDecision, target?: string): ApprovalPrompt {
+  const targetText = target ? displayPolicyTarget(target) : undefined;
   return {
-    heading: `[Cerberus] DENY request ${safe(requestId)}: ${safe(toolName)} (${decision.ruleId})`,
-    detail: `Reason: ${safe(decision.reason)}`,
-    question: 'Override this firewall DENY for this request only?',
+    requestId,
+    heading: `Cerberus blocked ${policyAction(toolName)}`,
+    detail: `${targetText ? `Target: ${targetText}\n` : ''}Reason: ${policyReason(decision.ruleId, decision.reason)}`,
+    question: 'Allow once applies only to this call.',
+    blockLabel: 'Keep blocked (recommended)',
+    allowLabel: 'Allow this call once',
+    allowOverride: true,
   };
+}
+
+function displayPolicyTarget(target: string): string {
+  const value = safe(target).replace(/\\/g, '/').replace(/\/+$/, '');
+  if (value === '/workspace') return 'project root';
+  if (value.startsWith('/workspace/')) return value.slice('/workspace/'.length);
+  if (value === '.' || value === './') return 'project root';
+  if (value.startsWith('/') || /^[a-z]:\//i.test(value) || value === '..' || value.startsWith('../')) return 'outside the project';
+  return value.replace(/^\.\//, '');
+}
+
+function policyReason(ruleId: PolicyDecision['ruleId'], fallback: string): string {
+  switch (ruleId) {
+    case 'PROTECTED_PATH': return 'This project path is protected by policy.';
+    case 'PATH_NOT_ALLOWED': return 'This target is outside the project paths Cerberus allows.';
+    case 'PERSISTENCE_PATH': return 'Cerberus protects this project file from changes.';
+    case 'WRITE_NOT_ALLOWED': return 'Writes are limited to approved project paths.';
+    case 'DEFAULT_DENY': return 'This tool is not approved by policy.';
+    default: return safe(fallback);
+  }
+}
+
+function policyAction(toolName: string): string {
+  const name = toolName.split('/').at(-1)?.toLowerCase() ?? '';
+  if (name.includes('write') || name.includes('create') || name.includes('edit')) return 'write';
+  if (name.includes('read') || name.includes('get')) return 'read';
+  if (name.includes('list') || name.includes('search')) return 'access';
+  return 'action';
 }
 
 /** The prompt for sandbox-rejected changes, or a log line when there are too many to review. */
@@ -45,20 +83,43 @@ export function describeChangesDeny(
   toolName: string,
   changes: readonly FileChange[],
   decisions: readonly ChangeDecision[],
-): ApprovalPrompt | { refused: string } {
+  overrideablePaths: readonly string[] = rejectedPathsByDefault(decisions),
+): ApprovalPrompt {
   const rejected = decisions.filter((decision) => decision.decision === 'DENY');
   if (rejected.length > MAX_REVIEW_ITEMS) {
-    return { refused: `[Cerberus] SANDBOX DENY request ${safe(requestId)}: ${rejected.length} rejected changes exceed the ${MAX_REVIEW_ITEMS}-item review limit; no override offered.` };
+    return {
+      requestId,
+      heading: 'Cerberus sandbox blocked changes',
+      detail: `${rejected.length} changes were rejected; the review limit is ${MAX_REVIEW_ITEMS}.`,
+      question: 'This change batch cannot be overridden.',
+      blockLabel: 'Keep changes blocked',
+      allowLabel: '',
+      allowOverride: false,
+    };
   }
   const list = rejected.map((decision) => {
     const change = changes.find((item) => item.path === decision.path);
-    return `${safe(decision.path)} (${decision.ruleId}${change ? `, ${change.kind}` : ''}: ${safe(decision.reason)})`;
-  }).join(', ');
+    return `• ${safe(decision.path)} — ${safe(decision.reason)} (${decision.ruleId}${change ? `; ${change.kind}` : ''})`;
+  }).join('\n');
+  const allowOverride = rejected.some((decision) => overrideablePaths.includes(decision.path));
   return {
-    heading: `[Cerberus] SANDBOX DENY request ${safe(requestId)}: ${safe(toolName)}`,
-    detail: `Rejected changes: ${list}`,
-    question: 'Apply these sandbox-rejected changes to the project for this request only?',
+    requestId,
+    heading: 'Cerberus blocked sandbox changes',
+    detail: `${safe(toolName)}\nChanges kept out:\n${list}`,
+    question: allowOverride ? 'Apply only the eligible changes once?' : 'These changes cannot be overridden.',
+    blockLabel: 'Keep changes out (recommended)',
+    allowLabel: 'Apply these changes once',
+    allowOverride,
   };
+}
+
+const NON_OVERRIDEABLE_RULES = new Set<ChangeDecision['ruleId']>([
+  'INVALID_ARGUMENTS', 'EVALUATION_ERROR', 'CHANGE_LIMIT', 'WRITE_CONFLICT', 'SYMLINK_DENIED',
+]);
+
+function rejectedPathsByDefault(decisions: readonly ChangeDecision[]): string[] {
+  return decisions.filter((decision) => decision.decision === 'DENY' && !NON_OVERRIDEABLE_RULES.has(decision.ruleId))
+    .map((decision) => decision.path);
 }
 
 /** Runs prompts one at a time so concurrent MCP calls cannot consume one another's answers. */
@@ -78,9 +139,10 @@ export function createSerializer(): <T>(operation: () => Promise<T>) => Promise<
 export function createTerminalApproval(options: TerminalApprovalOptions = {}): TerminalApproval {
   const serialize = createSerializer();
 
-  const ask = ({ heading, detail, question }: ApprovalPrompt): Promise<boolean> => serialize(async () => {
-    process.stderr.write(`${heading}\n${detail}\n`);
+  const ask = ({ requestId, heading, detail, question, allowOverride }: ApprovalPrompt): Promise<boolean> => serialize(async () => {
+    process.stderr.write(`[Cerberus] request ${safe(requestId)}\n${heading}\n${heading.toLowerCase().includes('sandbox') && detail ? `${detail}\n` : ''}`);
     if (!options.interactive) return false;
+    if (!allowOverride) return false;
     let terminal: Interface | undefined;
     let input: ReturnType<typeof createReadStream> | undefined;
     let output: ReturnType<typeof createWriteStream> | undefined;
@@ -105,7 +167,7 @@ export function createTerminalApproval(options: TerminalApprovalOptions = {}): T
   });
 
   return {
-    policy: (requestId, toolName, decision) => ask(describePolicyDeny(requestId, toolName, decision)),
+    policy: (requestId, toolName, decision, target) => ask(describePolicyDeny(requestId, toolName, decision, target)),
     changes: (requestId, toolName, changes, decisions) => {
       const prompt = describeChangesDeny(requestId, toolName, changes, decisions);
       if ('refused' in prompt) {

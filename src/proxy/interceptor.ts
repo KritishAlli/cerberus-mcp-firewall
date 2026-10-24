@@ -108,7 +108,12 @@ export function createInterceptor(deps: InterceptorDeps): ToolCallHandler {
     const prepared = prepareContext(requestId, deps.serverId, toolName, rawArgs, readSession(deps.getSession));
     let decision = prepared.ok ? evaluateSafely(prepared.ctx, deps, log, requestId) : prepared.decision;
     if (prepared.ok && decision.decision === 'DENY' && decision.ruleId !== 'EVALUATION_ERROR' && decision.ruleId !== 'INVALID_ARGUMENTS') {
-      if (await deps.terminalApproval?.policy(requestId, displayName, decision)) {
+      if (await deps.terminalApproval?.policy(
+        requestId,
+        displayName,
+        decision,
+        findRequestedPath(prepared.ctx.arguments, deps.policy.pathArgs),
+      )) {
         decision = {
           decision: 'ALLOW',
           ruleId: 'USER_APPROVED_OVERRIDE',
@@ -166,6 +171,28 @@ export function createInterceptor(deps: InterceptorDeps): ToolCallHandler {
     }
     return blockedResult(decision, requestId);
   };
+}
+
+/** Return one bounded path-like argument for the human approval prompt; never include payload text. */
+function findRequestedPath(arguments_: Record<string, unknown>, pathArgs: readonly string[]): string | undefined {
+  const names = new Set(pathArgs.map((name) => name.toLowerCase()));
+  const visit = (value: unknown): string | undefined => {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const found = visit(item);
+        if (found !== undefined) return found;
+      }
+      return undefined;
+    }
+    if (typeof value !== 'object' || value === null) return undefined;
+    for (const [key, child] of Object.entries(value)) {
+      if (names.has(key.toLowerCase()) && typeof child === 'string') return child.slice(0, 200);
+      const found = visit(child);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  };
+  return visit(arguments_);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,6 @@
+{
+  "name": "cerberus-codex-test-project",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Disposable fixture for testing Cerberus MCP enforcement from Codex"
+}

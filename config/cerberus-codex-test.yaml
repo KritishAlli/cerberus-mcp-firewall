@@ -1,0 +1,57 @@
+# Disposable sandbox config for testing Cerberus from Codex.
+# The Docker filesystem server sees only demo/cerberus-codex-test via /workspace.
+
+server:
+  id: fs
+  command: node
+  args: ["/app/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "/workspace"]
+  timeoutMs: 10000
+  sandbox:
+    image: mcp-firewall-sandbox:dev
+    project: ../demo/cerberus-codex-test
+
+monitor:
+  enabled: true
+  host: 127.0.0.1
+  port: 3001
+  maxEvents: 100
+
+policy:
+  defaultDecision: DENY
+  protectedPaths:
+    - "**/.env"
+  allowedRoots: [".", "/workspace"]
+  allowedHosts: []
+  approvedTools:
+    - fs/read_file
+    - fs/read_text_file
+    - fs/read_media_file
+    - fs/read_multiple_files
+    - fs/write_file
+    - fs/edit_file
+    - fs/create_directory
+    - fs/list_directory
+    - fs/list_directory_with_sizes
+    - fs/directory_tree
+    - fs/move_file
+    - fs/search_files
+    - fs/get_file_info
+    - fs/list_allowed_directories
+  pathArgs: [path, paths, source, destination]
+  writeTools:
+    - fs/write_file
+    - fs/edit_file
+    - fs/create_directory
+    - fs/move_file
+  staging:
+    writablePaths:
+      - "src/**"
+      - "README.md"
+    protectedWritePaths:
+      - ".git/**"
+      - ".husky/**"
+      - ".github/workflows/**"
+      - ".vscode/**"
+      - "package.json"
+    maxFileBytes: 65536
+    maxChangesPerCall: 20

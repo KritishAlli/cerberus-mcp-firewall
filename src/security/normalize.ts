@@ -97,7 +97,7 @@ export function destinationAllowed(destination: DestinationMatch, allowedHosts: 
 /** True only when a normalized path is equal to an allowed root or a descendant of it. */
 export function pathWithinRoots(value: string, roots: readonly string[]): boolean {
   const candidate = normalizePath(decodePath(value));
-  if (candidate === '' || candidate === '.' || candidate === '..' || candidate.startsWith('../')) return false;
+  if (candidate === '' || candidate === '..' || candidate.startsWith('../')) return false;
   return roots.some((rootValue) => {
     const normalizedRoot = normalizePath(decodePath(rootValue));
     const root = normalizedRoot === '/' ? '/' : normalizedRoot.replace(/\/$/, '');

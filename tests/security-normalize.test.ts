@@ -29,6 +29,15 @@ function request(arguments_: Record<string, unknown>, overrides: Partial<ToolCal
 }
 
 describe('path and destination security normalization', () => {
+  it('allows listing the configured relative project root', () => {
+    expect(pathWithinRoots('.', ['.'])).toBe(true);
+    expect(evaluateToolCall(request({ path: '.' }, { toolName: 'list_directory' }), {
+      ...basePolicy,
+      allowedRoots: ['.'],
+      approvedTools: ['fs/list_directory'],
+    })).toMatchObject({ decision: 'ALLOW', ruleId: 'APPROVED_TOOL' });
+  });
+
   it('normalizes trailing separators before matching protected paths', () => {
     expect(normalizePath('/workspace/.env/')).toBe('/workspace/.env');
     expect(pathMatches('/workspace/.env/', '**/.env')).toBe(true);
@@ -99,6 +108,24 @@ describe('path and destination security normalization', () => {
       writeTools: ['fs/write_file'],
     });
     expect(result).toMatchObject({ decision: 'DENY', ruleId: 'SECRET_DETECTED' });
+  });
+
+  it('denies a no-op write to a protected staging path before calling the filesystem server', () => {
+    const result = evaluateToolCall(request({
+      path: '/workspace/package.json',
+      content: '{"name":"unchanged"}',
+    }, { toolName: 'write_file' }), {
+      ...basePolicy,
+      approvedTools: ['fs/write_file'],
+      writeTools: ['fs/write_file'],
+      staging: {
+        writablePaths: ['src/**'],
+        protectedWritePaths: ['package.json'],
+        maxFileBytes: 65536,
+        maxChangesPerCall: 20,
+      },
+    });
+    expect(result).toMatchObject({ decision: 'DENY', ruleId: 'PERSISTENCE_PATH' });
   });
 
   it('rejects malformed or non-HTTP URL schemes for configured destination tools', () => {

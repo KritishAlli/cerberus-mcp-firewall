@@ -9,6 +9,7 @@ import {
   matchDeniedTool,
   matchDestructiveAction,
   matchProtectedPath,
+  matchStagedWritePath,
   matchTaintedSession,
 } from './rules.js';
 
@@ -23,6 +24,7 @@ export const evaluateToolCall: EvaluateToolCall = (request, policy) => {
     matchDeniedTool(context, checkedPolicy.data),
     matchProtectedPath(context, checkedPolicy.data),
     matchAllowedRoot(context, checkedPolicy.data),
+    matchStagedWritePath(context, checkedPolicy.data),
     matchDeniedDestination(context, checkedPolicy.data),
     matchArgumentSecrets(context, checkedPolicy.data),
     matchDestructiveAction(context, checkedPolicy.data),

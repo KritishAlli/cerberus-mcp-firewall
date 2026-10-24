@@ -7,6 +7,7 @@ import {
   extractUrlReferences,
   isPlainRecord,
   normalizeDestination,
+  normalizePath,
   pathMatches,
   pathWithinRoots,
 } from './normalize.js';
@@ -167,6 +168,48 @@ export function matchAllowedRoot(request: ToolCallContext, policy: FirewallPolic
     }
   }
   return undefined;
+}
+
+/**
+ * Reject staged filesystem writes by target path before calling the server.
+ * Post-call diffing still enforces these rules as a second layer, but it cannot
+ * observe a no-op write whose bytes match the project already.
+ */
+export function matchStagedWritePath(request: ToolCallContext, policy: FirewallPolicy): PolicyDecision | undefined {
+  const staging = policy.staging;
+  if (!staging || !isWriteTool(request, policy)) return undefined;
+  const { values, valid } = argumentStrings(request, policy);
+  if (!valid) return deny('INVALID_ARGUMENTS', 'A configured path or destination argument must contain strings');
+
+  for (const item of values) {
+    if (!item.isPathArgument) continue;
+    for (const candidate of pathCandidates(item)) {
+      const relative = relativeToAllowedRoot(candidate, policy.allowedRoots);
+      // matchAllowedRoot runs first and reports paths outside every configured root.
+      if (relative === undefined || relative === '') continue;
+      if (staging.protectedWritePaths.some((pattern) => pathMatches(relative, pattern))) {
+        return deny('PERSISTENCE_PATH', 'Write target is a protected persistence location');
+      }
+      if (!staging.writablePaths.some((pattern) => pathMatches(relative, pattern))) {
+        return deny('WRITE_NOT_ALLOWED', 'Write target is outside the configured writable paths');
+      }
+    }
+  }
+  return undefined;
+}
+
+function relativeToAllowedRoot(candidate: string, allowedRoots: readonly string[]): string | undefined {
+  const normalized = normalizePath(candidate);
+  const absoluteRoots = allowedRoots
+    .map(normalizePath)
+    .filter((root) => root.startsWith('/') || /^[a-z]:\//i.test(root))
+    .sort((a, b) => b.length - a.length);
+  for (const root of absoluteRoots) {
+    if (normalized === root) return '';
+    if (normalized.startsWith(`${root}/`)) return normalized.slice(root.length + 1);
+  }
+  if (normalized.startsWith('/') || /^[a-z]:\//i.test(normalized)) return undefined;
+  return pathWithinRoots(normalized, allowedRoots) ? normalized.replace(/^\.\//, '') : undefined;
 }
 
 export function matchDeniedDestination(request: ToolCallContext, policy: FirewallPolicy): PolicyDecision | undefined {

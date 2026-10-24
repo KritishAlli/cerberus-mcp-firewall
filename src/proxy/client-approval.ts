@@ -55,12 +55,12 @@ export function createClientApproval(options: ClientApprovalOptions = {}): Clien
     }
   };
 
-  const ask = (target: ApprovalClient, { heading, detail, question }: ApprovalPrompt): Promise<boolean> => serialize(async () => {
-    log(`${heading}\n${detail}`);
+  const ask = (target: ApprovalClient, { requestId, heading, detail, question, blockLabel, allowLabel, allowOverride }: ApprovalPrompt): Promise<boolean> => serialize(async () => {
+    log(`[Cerberus] request ${requestId}\n${heading}\n${detail}`);
     let approved = false;
     try {
-      const result = await target.elicit(approvalForm(heading, detail, question), { timeout: timeoutMs });
-      approved = result.action === 'accept' && result.content?.decision === ALLOW_ONCE;
+      const result = await target.elicit(approvalForm(heading, detail, question, blockLabel, allowLabel, allowOverride), { timeout: timeoutMs });
+      approved = allowOverride && result.action === 'accept' && result.content?.decision === ALLOW_ONCE;
     } catch (err) {
       log(`[Cerberus] Approval dialog failed (${err instanceof Error ? err.constructor.name : typeof err}); keeping the DENY.`);
       return false;
@@ -75,38 +75,35 @@ export function createClientApproval(options: ClientApprovalOptions = {}): Clien
     attach: (connected) => {
       client = connected;
     },
-    policy: (requestId, toolName, decision: PolicyDecision) => {
+    policy: (requestId, toolName, decision: PolicyDecision, requestedTarget?: string) => {
       const target = usable();
-      if (!target) return options.fallback?.policy(requestId, toolName, decision) ?? Promise.resolve(false);
-      return ask(target, describePolicyDeny(requestId, toolName, decision));
+      if (!target) return options.fallback?.policy(requestId, toolName, decision, requestedTarget) ?? Promise.resolve(false);
+      return ask(target, describePolicyDeny(requestId, toolName, decision, requestedTarget));
     },
-    changes: (requestId, toolName, changes: readonly FileChange[], decisions: readonly ChangeDecision[]) => {
+    changes: (requestId, toolName, changes: readonly FileChange[], decisions: readonly ChangeDecision[], overrideablePaths?: readonly string[]) => {
       const target = usable();
-      if (!target) return options.fallback?.changes(requestId, toolName, changes, decisions) ?? Promise.resolve(false);
-      const prompt = describeChangesDeny(requestId, toolName, changes, decisions);
-      if ('refused' in prompt) {
-        log(prompt.refused);
-        return Promise.resolve(false);
-      }
+      if (!target) return options.fallback?.changes(requestId, toolName, changes, decisions, overrideablePaths) ?? Promise.resolve(false);
+      const prompt = describeChangesDeny(requestId, toolName, changes, decisions, overrideablePaths);
       return ask(target, prompt);
     },
   };
 }
 
 /** A single required choice, Block preselected. Text is already sanitized by describe*Deny. */
-function approvalForm(heading: string, detail: string, question: string): ElicitRequestFormParams {
+function approvalForm(heading: string, detail: string, question: string, blockLabel: string, allowLabel: string, allowOverride: boolean): ElicitRequestFormParams {
+  const userMessage = `${heading}${detail ? `\n\n${detail}` : ''}\n\n${question}`;
   return {
     mode: 'form',
-    message: `${heading.replace(/^\[Cerberus\] /, 'Cerberus blocked ')}\n${detail}\n\n${question}`,
+    message: userMessage,
     requestedSchema: {
       type: 'object',
       properties: {
         decision: {
           type: 'string',
-          title: 'Decision',
+          title: 'Action',
           oneOf: [
-            { const: 'block', title: 'Block (recommended)' },
-            { const: ALLOW_ONCE, title: 'Allow this one request' },
+            { const: 'block', title: blockLabel },
+            ...(allowOverride ? [{ const: ALLOW_ONCE, title: allowLabel }] : []),
           ],
           default: 'block',
         },

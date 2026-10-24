@@ -54,7 +54,7 @@ export const STAGED_META_KEY = 'mcp-firewall/staged';
 /** Start of the text of every result where staging refused or failed the call. */
 export const STAGING_ERROR_PREFIX = '[MCP Firewall] STAGING ERROR';
 /** Start of the note put first in a result when some of its file changes were rejected. */
-export const REJECTED_CHANGES_PREFIX = 'MCP Firewall: changes blocked.';
+export const REJECTED_CHANGES_PREFIX = 'Cerberus sandbox blocked changes.';
 /** Put before the server's first text block in such a result, so its own "success" text can't stand alone. */
 export const SERVER_OUTPUT_PREFIX = 'Server output (from the sandboxed copy; see firewall note above):';
 
@@ -295,9 +295,15 @@ async function settleChanges(
         && change.kind !== 'special'
         && !staging.area.forcedDenyReason(change.path);
     });
-    if (eligible.length > 0 && staging.terminalApproval
-      && await staging.terminalApproval(ctx.requestId, ctx.toolName, eligible,
-        eligible.map((change) => decisions.find((decision) => decision.path === change.path)!))) {
+    const rejectedChanges = changes.filter((_, index) => decisions[index]!.decision === 'DENY');
+    if (rejectedChanges.length > 0 && staging.terminalApproval
+      && await staging.terminalApproval(
+        ctx.requestId,
+        ctx.toolName,
+        rejectedChanges,
+        rejectedChanges.map((change) => decisions.find((decision) => decision.path === change.path)!),
+        eligible.map((change) => change.path),
+      )) {
       const approved = new Set(eligible.map((change) => change.path));
       decisions = decisions.map((decision) => approved.has(decision.path)
         ? {
@@ -309,8 +315,8 @@ async function settleChanges(
         : decision);
     }
     results = await staging.area.apply(changes, decisions, projectAtSync);
-    const rejected = results.filter((r) => !r.applied).map((r) => r.path);
-    if (rejected.length > 0) restored = await staging.area.revert(rejected);
+    const rejectedResults = results.filter((r) => !r.applied).map((r) => r.path);
+    if (rejectedResults.length > 0) restored = await staging.area.revert(rejectedResults);
   }
   await staging.area.removeExcluded();
   const entries = results.map((r): StagedChange => ({ path: r.path, decision: r.applied ? 'ALLOW' : 'DENY', ruleId: r.ruleId }));
@@ -377,7 +383,7 @@ function withStagedMeta(result: CallToolResult, entries: StagedChange[]): CallTo
 function rejectionNote(rejected: StagedChange[], applied: StagedChange[]): string {
   const rejectedList = listPaths(rejected, (e) => `${displayPath(e.path)} (${e.ruleId})`);
   const appliedList = applied.length > 0 ? listPaths(applied, (e) => displayPath(e.path)) : 'none';
-  return `${REJECTED_CHANGES_PREFIX} The tool ran against a sandboxed copy; these changes were NOT applied to the project and were reverted: ${rejectedList}. Applied: ${appliedList}.`;
+  return `${REJECTED_CHANGES_PREFIX} Reverted and not applied to your project: ${rejectedList}. Applied: ${appliedList}.`;
 }
 
 /** At most MAX_REPORTED_CHANGES, then a count of the rest. */
