@@ -18,7 +18,9 @@ import { startProxyServer, type ProxyServerHandle } from './proxy/server.js';
 import { initStaging, type StagingDeps } from './proxy/staged-call.js';
 import { createStagingArea, StagingLock, sweepStaleStagingDirs, type StagingArea, type SyncResult } from './proxy/staging.js';
 import { connectUpstream, type UpstreamConnection } from './proxy/upstream.js';
+import { createClientApproval } from './proxy/client-approval.js';
 import { createTerminalApproval } from './proxy/terminal-approval.js';
+import { evaluateFileChanges } from './security/changes.js';
 import { evaluateToolCall } from './security/evaluator.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -48,7 +50,11 @@ async function main(): Promise<void> {
   // synced before it starts. Without server.sandbox this is the original local launch.
   let staging: StagingArea | undefined;
   let initial: SyncResult | undefined;
-  const terminalApproval = createTerminalApproval();
+  // Overrides are asked in the agent client's dialog. The /dev/tty prompt would fight the
+  // client's TUI for the same terminal, so it is opt-in for a gateway run in its own terminal.
+  const approval = createClientApproval({
+    fallback: createTerminalApproval({ interactive: process.env.CERBERUS_TTY_APPROVAL === '1' }),
+  });
   let upstream: UpstreamConnection | undefined;
   // Any startup failure (sync, launch mapping, preflight, launch, proxy) stops what already
   // started and removes the staging copy, then rethrows the original error.
@@ -89,7 +95,7 @@ async function main(): Promise<void> {
         lock: new StagingLock(),
         evaluateFileChanges,
         policy: config.policy,
-        terminalApproval: terminalApproval.changes,
+        terminalApproval: approval.changes,
         onFileChangeEvent: publishFileChangeEvent,
       };
       await initStaging(stagingDeps, { serverId: config.server.id, initial });
@@ -99,7 +105,7 @@ async function main(): Promise<void> {
       policy: config.policy,
       evaluate: evaluateToolCall,
       publish: publishEvent,
-      terminalApproval,
+      terminalApproval: approval,
       forward: (toolName, args, options) => connected.callTool(toolName, args, options),
       ...(stagingDeps ? { staging: stagingDeps } : {}),
     });
@@ -121,7 +127,10 @@ async function main(): Promise<void> {
     process.once('SIGTERM', () => shutdown('SIGTERM'));
     process.stdin.once('end', () => shutdown('stdin ended'));
 
-    proxy = await startProxyServer(connected, handleToolCall, { onClose: () => shutdown('agent disconnected') });
+    proxy = await startProxyServer(connected, handleToolCall, {
+      onClose: () => shutdown('agent disconnected'),
+      onClient: approval.attach,
+    });
   } catch (err) {
     await abandonStartup(upstream, staging);
     throw err;
