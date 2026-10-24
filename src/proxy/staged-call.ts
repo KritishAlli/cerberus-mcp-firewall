@@ -15,8 +15,8 @@
  *   6. apply approved changes, revert rejected ones, remove excluded paths from staging,
  *      and set the baseline for the next catch-up to the expected state (no rescan of
  *      staging, so a write landing after step 4 is caught next time, not overwritten)
- *   7. _meta['mcp-firewall/staged'], a note listing rejected paths, and a FileChangeEvent
- *      if there were any changes
+ *   7. _meta['mcp-firewall/staged'], a FileChangeEvent if there were any changes, and,
+ *      if any were rejected, isError plus a note first in the result listing them
  *
  * Any error from sync/diff/apply/revert breaks staging for good: nothing more is
  * applied and every later allowed call is refused until restart. Allowed calls are
@@ -52,8 +52,10 @@ import { evaluateFileChangesStub } from './stubs/evaluate-file-changes.stub.js';
 export const STAGED_META_KEY = 'mcp-firewall/staged';
 /** Start of the text of every result where staging refused or failed the call. */
 export const STAGING_ERROR_PREFIX = '[MCP Firewall] STAGING ERROR';
-/** Start of the note appended to a result when some of its file changes were rejected. */
-export const REJECTED_CHANGES_PREFIX = '[MCP Firewall] REJECTED FILE CHANGES';
+/** Start of the note put first in a result when some of its file changes were rejected. */
+export const REJECTED_CHANGES_PREFIX = 'MCP Firewall: changes blocked.';
+/** Put before the server's first text block in such a result, so its own "success" text can't stand alone. */
+export const SERVER_OUTPUT_PREFIX = 'Server output (from the sandboxed copy; see firewall note above):';
 
 /** Used when no evaluateFileChanges is injected. TODO: Winston's src/security/changes.ts once it lands. */
 export const defaultEvaluateFileChanges: EvaluateFileChanges = evaluateFileChangesStub;
@@ -62,7 +64,7 @@ const LATE_TOOL_NAME = '<late-writes>';
 const STARTUP_TOOL_NAME = '<startup>';
 const STARTUP_REQUEST_ID = 'startup';
 const STARTUP_REASON = 'change made before any tool call';
-/** Changes listed in _meta and rejected paths listed in the result note; the rest are only counted. */
+/** Changes listed in _meta, and rejected and applied paths listed in the result note; the rest are only counted. */
 export const MAX_REPORTED_CHANGES = 100;
 
 /** What staged-call needs from a StagingArea (an interface, so tests can wrap one). */
@@ -321,21 +323,40 @@ function decide(staging: StagingDeps, changes: FileChange[], ctx: StagedCallCont
 
 function withStagedMeta(result: CallToolResult, entries: StagedChange[]): CallToolResult {
   const rejected = entries.filter((e) => e.decision !== 'ALLOW');
+  const applied = entries.filter((e) => e.decision === 'ALLOW');
   const staged: StagedMeta = {
-    applied: entries.length - rejected.length,
+    applied: applied.length,
     rejected: rejected.length,
     changes: entries.slice(0, MAX_REPORTED_CHANGES),
     ...(entries.length > MAX_REPORTED_CHANGES ? { truncated: true as const } : {}),
   };
-  const content =
-    rejected.length > 0 ? [...result.content, { type: 'text' as const, text: rejectionNote(rejected, staged.applied) }] : result.content;
-  return { ...result, content, _meta: { ...result._meta, [STAGED_META_KEY]: staged } };
+  const withMeta = { ...result, _meta: { ...result._meta, [STAGED_META_KEY]: staged } };
+  if (rejected.length === 0) return withMeta;
+
+  // Even a partial rejection is an error: the agent must not assume the whole action succeeded.
+  const firstText = result.content.findIndex((block) => block.type === 'text');
+  const serverContent = result.content.map((block, i) =>
+    i === firstText && block.type === 'text' ? { ...block, text: `${SERVER_OUTPUT_PREFIX}\n${block.text}` } : block,
+  );
+  // The server's structuredContent would still read as plain success, so it is dropped.
+  const { structuredContent: _dropped, ...rest } = withMeta;
+  return {
+    ...rest,
+    isError: true,
+    content: [{ type: 'text' as const, text: rejectionNote(rejected, applied) }, ...serverContent],
+  };
 }
 
-function rejectionNote(rejected: StagedChange[], applied: number): string {
-  const listed = rejected.slice(0, MAX_REPORTED_CHANGES).map((e) => `${displayPath(e.path)} (${e.ruleId})`);
-  const more = rejected.length > MAX_REPORTED_CHANGES ? `, ...and ${rejected.length - MAX_REPORTED_CHANGES} more` : '';
-  return `${REJECTED_CHANGES_PREFIX}: ${rejected.length} file change(s) made by the tool server were rejected and not applied to the project: ${listed.join(', ')}${more}. ${applied} change(s) were applied.`;
+function rejectionNote(rejected: StagedChange[], applied: StagedChange[]): string {
+  const rejectedList = listPaths(rejected, (e) => `${displayPath(e.path)} (${e.ruleId})`);
+  const appliedList = applied.length > 0 ? listPaths(applied, (e) => displayPath(e.path)) : 'none';
+  return `${REJECTED_CHANGES_PREFIX} The tool ran against a sandboxed copy; these changes were NOT applied to the project and were reverted: ${rejectedList}. Applied: ${appliedList}.`;
+}
+
+/** At most MAX_REPORTED_CHANGES, then a count of the rest. */
+function listPaths(entries: StagedChange[], show: (e: StagedChange) => string): string {
+  const listed = entries.slice(0, MAX_REPORTED_CHANGES).map(show).join(', ');
+  return entries.length > MAX_REPORTED_CHANGES ? `${listed}, ...and ${entries.length - MAX_REPORTED_CHANGES} more` : listed;
 }
 
 function emitFileChangeEvent(
