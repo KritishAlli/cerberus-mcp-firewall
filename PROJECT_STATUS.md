@@ -1,6 +1,6 @@
 # Project status: proxy and enforcement (Aarav)
 
-Merged to `main` (PRs #2, #7, #9, #10, #11, #12). In progress on `aarav/interceptor-staging`: staged writes in the interceptor (not yet merged). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
+Merged to `main` (PRs #2, #7, #9, #10, #11, #12, #16). In progress on `aarav/docker-fixes`: fixes from the first Docker run (not yet merged). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ## Done
 
@@ -23,7 +23,7 @@ Merged to `main` (PRs #2, #7, #9, #10, #11, #12). In progress on `aarav/intercep
   - `upstream.launch` / `describeLaunch()` report `{ mode, image?, containerName?, sandboxed }` for the monitor and `/health`. Not wired in yet.
   - `src/index.ts` now passes `launch: localLaunch(config.server)` explicitly. No new config keys; behavior is unchanged.
   - See [DECISIONS §11](docs/DECISIONS.md).
-- **`tests/upstream-docker.test.ts`**: 29 unit tests that need no Docker: the exact argv and its order, defaults, every rejection case, env passthrough only when explicit, preflight failures that never spawn, no pull, and container removal on close. There are also 3 integration tests (real `node:22-slim` container: tools through the proxy, no network, writes only to `/workspace` and `/tmp`). They are **skipped on this machine because Docker isn't installed, so they have never been run**. Fixture: `tests/fixtures/docker-server.mjs`.
+- **`tests/upstream-docker.test.ts`**: 31 unit tests that need no Docker: the exact argv and its order, defaults, every rejection case, env passthrough only when explicit, preflight failures that never spawn (no CLI, daemon down, timeout), no pull, and container removal on close. There are also 3 integration tests (real `node:22-slim` container: tools through the proxy, no network, writes only to `/workspace` and `/tmp`). Without Docker or the image they are skipped with the reason logged; `npm run test:docker` (`REQUIRE_DOCKER=1`) fails instead. Fixture: `tests/fixtures/docker-server.mjs`.
 - **`src/proxy/server.ts`**: `startProxyServer(upstream, handler, { transport?, onClose? })` is a low-level `Server`. `tools/list` passes through unchanged, `tools/call` goes to the interceptor with the cancellation signal, and downstream `instructions` are not forwarded.
 - **`src/index.ts`**: passes the signal through, and shuts down cleanly on agent disconnect, stdin end, SIGINT or SIGTERM (2 s cap), closing the upstream, proxy and monitor. A downstream crash keeps the proxy up and fails closed. Kritish's PR #6 added one line wiring `/health` to live state: `monitor?.setProtectedServers(() => (upstream.connected ? 1 : 0))`. Reviewed: correct, and the optional chaining keeps enforcement independent of the monitor.
 - **`tests/fixtures/counting-server.ts`**: test-only stdio server (`echo`, `read_file`, `structured`, `tool_error`, `hang`, `crash`, `get_call_counts`) with an optional `--counts-file`.
@@ -45,6 +45,18 @@ Merged to `main` (PRs #2, #7, #9, #10, #11, #12). In progress on `aarav/intercep
     - T01: `read_project_file` is ALLOWed, forwarded once, and its result is identical to a direct call
     - T02–T04: PROTECTED_PATH, DENIED_DESTINATION and DENIED_TOOL are each BLOCKED with a count of 0
   - vertical slice (T10): the real CLI with its monitor on a free port. One allowed and one denied call, then `GET /events` replays exactly those two events (decision, ruleId, matching `requestId`), `counts` is `{inspected: 2, allowed: 1, denied: 1}`, `/health` is `{status: ok, protectedServers: 1}`, and no argument values or the mock's secret appear in the stream (T11)
+
+## Docker integration: verified (2026-10-24)
+
+- **Tests:** `tests/upstream-docker.test.ts` 32/32 on `main` with Docker 29.9.2 and `node:22-slim`, integration tests included (34/34 on `aarav/docker-fixes`).
+- **Live container** (`config/sandbox.yaml`, `docker inspect`): network `none`, read-only root, CapDrop `ALL` (CapEff 0), `no-new-privileges`, user `501:20`, 512m / 128 pids, `/tmp` tmpfs `noexec,nosuid`, one bind mount: the staging mirror at `/workspace`.
+- **Preflight:** refuses to start with Docker stopped and with the image missing; nothing is pulled and no staging dir is left.
+- **Fixes on `aarav/docker-fixes`:**
+  - `start`/`dev` run `node --import tsx`: under the `tsx` CLI, Ctrl-C SIGKILLed the firewall before cleanup and left the staging dir behind every time ([DECISIONS §13](docs/DECISIONS.md)). Verified: 3/3 Ctrl-C runs of `npm start` leave no staging dir and no container.
+  - Stale staging-dir sweep at startup, guarded by an owner file (pid, start time) next to the mirror, never inside `/workspace`. Verified: after a SIGKILL, the next start removes the dir.
+  - Preflight now says "docker CLI not found" or "the Docker daemon isn't responding (is Docker running?)" instead of `(Error)`.
+  - `npm run test:docker`: the integration tests fail instead of skipping without Docker.
+  - Startup failures after the staging area exists (sync, launch mapping, preflight, launch, proxy) close the downstream and remove the staging dir, logging a failed cleanup instead of masking the original error. CLI tests cover a failed sync and a missing image.
 
 ## Claude Code setup (verified)
 
@@ -104,12 +116,12 @@ From `src/proxy/interceptor.ts`:
 
 ## Blockers
 
-- **Docker is not installed on Aarav's machine.** The Docker integration tests in `tests/upstream-docker.test.ts` (3, always skipped here) and the sandboxed demo can't be run until it is. Install Docker Desktop and `docker pull node:22-slim`, or run them on a teammate's machine.
+- ~~Docker is not installed on Aarav's machine~~: installed; integration tests verified (see above).
 
 
 - ~~`src/security/evaluator.ts` is the deny-all stub~~: Winston's real evaluator landed on `main` in PR #4 (`40ea8e4`). With the shipped policy it returns ALLOW / PROTECTED_PATH / DENIED_DESTINATION / DENIED_TOOL for the four demo calls, consistent with design §7.
 - ~~`demo/mock-server.ts` is a stub~~: landed in PR #3 (`6a7f51d`).
-- **Release gate (§10): all three commands pass** on this machine: `npm run typecheck`, `npm test` (on `aarav/interceptor-staging`: 211 passed, 3 skipped without Docker, 8 todo) and `npm run demo` (DEMO PASSED, all 12 checks).
+- **Release gate (§10): all four commands pass** on this machine: `npm run typecheck`, `npm test` (on `aarav/docker-fixes`: 252 passed, 8 todo), `npm run test:docker` with Docker running (34 passed; fails if Docker or `node:22-slim` is missing) and `npm run demo`.
 - **Open policy issues for Winston** (found in a read-only review; no proxy change needed):
   - case-variant protected paths are allowed on macOS
   - relative-path traversal is not resolved
@@ -154,10 +166,10 @@ Not changed in `src/shared/contracts.ts`; each needs Aarav, Winston and Kritish 
 6. **Staged writes:**
    - ~~Contract PR~~: merged (PR #10). See [DECISIONS §9](docs/DECISIONS.md).
    - ~~`src/proxy/staging.ts`~~: merged (PR #11).
-   - ~~Docker launch mode in upstream~~: merged (PR #12). Its integration tests still need a run on a machine with Docker and `node:22-slim`.
+   - ~~Docker launch mode in upstream~~: merged (PR #12). Integration tests verified with Docker (2026-10-24).
    - ~~Interceptor integration~~: built on `aarav/interceptor-staging`.
    - **Next, in order:**
-     1. **Run the docker-upstream integration tests on `main` with Docker.** docker-upstream (PR #12) is merged, but its 3 Docker integration tests have never run. Running them is the next step once Docker is installed (see Blockers). Fix anything they find before building on it.
+     1. ~~Run the docker-upstream integration tests on `main` with Docker~~: 32/32; fixes on `aarav/docker-fixes`.
      2. **Kritish: `toUpstreamLaunch` in the config loader.** Map `server.sandbox` (and `policy.staging`) onto `UpstreamLaunch` from `src/proxy/upstream.ts`. Refuse to load if sandbox mode is set without `policy.staging`.
      3. **`src/index.ts` wiring**, in this order. Each step must throw and stop startup on failure:
         1. `createStagingArea({ projectRoot, extraExcludes, maxFileBytes, maxChangesPerCall })` from `policy.staging`

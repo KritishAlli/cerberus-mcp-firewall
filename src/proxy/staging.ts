@@ -34,6 +34,7 @@ import {
   rmdir,
   symlink,
   unlink,
+  writeFile,
   type FileHandle,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -48,6 +49,17 @@ const HASH_CHUNK_BYTES = 64 * 1024;
 const MAX_LOGGED_UNSAFE = 10;
 /** Read-only, no final symlink, and no blocking if a FIFO was swapped in after lstat. */
 const SAFE_READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+const STAGING_DIR_PREFIX = 'mcp-firewall-staging-';
+/** mkdtemp appends six characters from [A-Za-z0-9]; any other name is not ours. */
+const STAGING_DIR_NAME = /^mcp-firewall-staging-[A-Za-z0-9]{6}$/;
+/** Next to the mirror, never inside it: { pid, startedAt } of the firewall that created the dir. */
+const OWNER_FILE = 'owner.json';
+/** The mirror itself: stagingRoot, mounted as /workspace. */
+const TREE_DIR = 'tree';
+const MAX_OWNER_FILE_BYTES = 1024;
+/** A staging dir without a readable owner file is swept only once it is this old. */
+const UNOWNED_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 
 export class StagingError extends Error {
   override name = 'StagingError';
@@ -458,9 +470,111 @@ async function lstatIfPresent(abs: string | Buffer): Promise<Stats | undefined> 
 }
 
 // ---------------------------------------------------------------------------
+// Stale staging dirs
+// ---------------------------------------------------------------------------
+
+interface StagingOwner {
+  pid: number;
+  startedAt: string;
+}
+
+export interface SweepOptions {
+  /** Where staging dirs are created. Default os.tmpdir(). */
+  parent?: string;
+  /** Diagnostics sink (one line, no trailing newline). Defaults to stderr. */
+  log?: (line: string) => void;
+  /** Tests only: the uid that counts as ours (default process.getuid()). */
+  uid?: number;
+}
+
+/**
+ * Removes staging dirs left behind by firewall processes that died before
+ * dispose() (e.g. SIGKILL). Call once at startup, before createStagingArea().
+ * Touches only entries of `parent` named exactly like ours that are real
+ * directories (never symlinks) owned by this uid, and only when their owner
+ * file names a pid that no longer exists (ESRCH), or, with no readable owner
+ * file, when the dir is older than 24 hours. A live instance's dir is kept,
+ * and so is one whose pid was reused. Logs names only; never throws.
+ * Returns the names removed.
+ */
+export async function sweepStaleStagingDirs(options: SweepOptions = {}): Promise<string[]> {
+  const log = options.log ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const removed: string[] = [];
+  try {
+    const uid = options.uid ?? process.getuid?.();
+    if (uid === undefined) return removed;
+    const parent = await realpath(options.parent ?? tmpdir());
+    for (const name of (await readdir(parent)).sort()) {
+      if (!STAGING_DIR_NAME.test(name)) continue;
+      const dir = path.join(parent, name);
+      try {
+        const st = await lstat(dir);
+        if (!st.isDirectory() || st.uid !== uid) continue;
+        const owner = await readOwner(dir);
+        const stale = owner ? !isProcessAlive(owner.pid) : Date.now() - st.mtimeMs > UNOWNED_MIN_AGE_MS;
+        if (!stale) continue;
+        // rm() does not follow symlinks: if the dir was swapped for one since lstat, only the link goes.
+        await rm(dir, { recursive: true, force: true });
+        removed.push(name);
+      } catch (err) {
+        log(`[firewall] staging: could not sweep stale staging dir ${name} (${errnoCode(err)})`);
+      }
+    }
+  } catch (err) {
+    log(`[firewall] staging: stale staging dir sweep failed (${errnoCode(err)})`);
+  }
+  if (removed.length > 0) {
+    log(`[firewall] staging: removed ${removed.length} stale staging dir(s): ${removed.join(', ')}`);
+  }
+  return removed;
+}
+
+/** The owner file of a staging dir, or undefined if it is missing, not a regular file, or malformed. */
+async function readOwner(dir: string): Promise<StagingOwner | undefined> {
+  let handle: FileHandle;
+  try {
+    handle = await open(path.join(dir, OWNER_FILE), SAFE_READ_FLAGS);
+  } catch {
+    return undefined;
+  }
+  try {
+    const st = await handle.stat();
+    if (!st.isFile() || st.size > MAX_OWNER_FILE_BYTES) return undefined;
+    const owner = JSON.parse(await handle.readFile('utf8')) as Partial<StagingOwner> | null;
+    // A pid <= 0 would make process.kill() signal a process group.
+    if (typeof owner?.pid !== 'number' || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) return undefined;
+    return { pid: owner.pid, startedAt: String(owner.startedAt) };
+  } catch {
+    return undefined;
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Only ESRCH means gone; EPERM means it exists under another user. */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+function errnoCode(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code) ? code : 'error';
+}
+
+// ---------------------------------------------------------------------------
 // Staging area
 // ---------------------------------------------------------------------------
 
+/**
+ * Layout: <parent>/mcp-firewall-staging-XXXXXX/{owner.json, tree/}. Only tree/ is
+ * the mirror (stagingRoot, mounted as /workspace), so the owner file is never
+ * scanned, diffed or visible to the server.
+ */
 export async function createStagingArea(options: StagingOptions): Promise<StagingArea> {
   const projectRoot = await realpath(options.projectRoot);
   const parent = await realpath(options.stagingParent ?? tmpdir());
@@ -468,7 +582,16 @@ export async function createStagingArea(options: StagingOptions): Promise<Stagin
   if (fromProject === '' || (!fromProject.startsWith('..') && !path.isAbsolute(fromProject))) {
     throw new StagingError('staging dir must not be inside the protected project');
   }
-  const stagingRoot = await mkdtemp(path.join(parent, 'mcp-firewall-staging-'));
+  const stagingDir = await mkdtemp(path.join(parent, STAGING_DIR_PREFIX));
+  try {
+    const owner: StagingOwner = { pid: process.pid, startedAt: new Date().toISOString() };
+    await writeFile(path.join(stagingDir, OWNER_FILE), `${JSON.stringify(owner)}\n`, { flag: 'wx', mode: 0o600 });
+    await mkdir(path.join(stagingDir, TREE_DIR), { mode: 0o700 });
+  } catch (err) {
+    await rm(stagingDir, { recursive: true, force: true });
+    throw err;
+  }
+  const stagingRoot = path.join(stagingDir, TREE_DIR);
   const excludes = [...(options.excludes ?? DEFAULT_EXCLUDES), ...(options.extraExcludes ?? [])];
   return new StagingArea(
     projectRoot,
@@ -477,6 +600,7 @@ export async function createStagingArea(options: StagingOptions): Promise<Stagin
     options.maxFileBytes,
     options.maxChangesPerCall ?? 1000,
     options.log ?? ((line: string) => process.stderr.write(`${line}\n`)),
+    stagingDir,
   );
 }
 
@@ -495,6 +619,8 @@ export class StagingArea {
     private readonly maxFileBytes: number,
     private readonly maxChangesPerCall: number,
     private readonly log: (line: string) => void,
+    /** What dispose() removes: stagingRoot's parent, holding it and the owner file. */
+    private readonly stagingDir: string,
   ) {}
 
   /**
@@ -703,9 +829,9 @@ export class StagingArea {
     return { staging, project: await scan(this.projectRoot, this.rules) };
   }
 
-  /** Removes the staging dir. */
+  /** Removes the staging dir: the mirror and its owner file. */
   async dispose(): Promise<void> {
-    await rm(this.stagingRoot, { recursive: true, force: true });
+    await rm(this.stagingDir, { recursive: true, force: true });
   }
 
   // --- diff ---------------------------------------------------------------

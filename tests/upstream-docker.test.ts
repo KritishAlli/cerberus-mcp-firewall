@@ -5,7 +5,8 @@
  * (mocked execFile) and container cleanup (a local fixture stands in for the
  * container). The integration block runs tests/fixtures/docker-server.mjs in
  * node:22-slim and is skipped, with the reason logged, when Docker or the
- * image is missing.
+ * image is missing. With REQUIRE_DOCKER=1 (npm run test:docker) it fails with
+ * that reason instead.
  */
 import { spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
@@ -172,9 +173,26 @@ describe('upstream / docker preflight and lifecycle', () => {
     const createTransport = vi.fn();
     const err = await connectUpstream(server, { launch: launch(), execFile, createTransport }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(SandboxUnavailableError);
-    expect((err as Error).message).toMatch(/sandbox mode requires Docker.*refusing to start/);
+    expect((err as Error).message).toBe('sandbox mode requires Docker, and docker CLI not found; refusing to start');
     expect(execFile).toHaveBeenCalledTimes(1);
     expect(execFile.mock.calls[0]?.slice(0, 2)).toEqual(['docker', ['version', '--format', '{{.Server.Version}}']]);
+    expect(createTransport).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['exits non-zero', Object.assign(new Error('Command failed: docker version'), { code: 1 })],
+    ['times out', Object.assign(new Error('Command failed: docker version'), { code: null, killed: true, signal: 'SIGTERM' })],
+  ])('refuses to start when the docker CLI %s (daemon down), and never spawns', async (_case, failure) => {
+    const execFile = vi.fn<ExecFileFn>(async () => {
+      throw failure;
+    });
+    const createTransport = vi.fn();
+    const err = await connectUpstream(server, { launch: launch(), execFile, createTransport }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxUnavailableError);
+    expect((err as Error).message).toBe(
+      "sandbox mode requires Docker, and the Docker daemon isn't responding (is Docker running?); refusing to start",
+    );
+    expect(execFile).toHaveBeenCalledTimes(1);
     expect(createTransport).not.toHaveBeenCalled();
   });
 
@@ -258,7 +276,8 @@ describe('upstream / docker preflight and lifecycle', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Integration: a real container. Skipped when Docker or node:22-slim is missing.
+// Integration: a real container. Skipped when Docker or node:22-slim is missing,
+// unless REQUIRE_DOCKER=1, which fails the block with the reason instead.
 // ---------------------------------------------------------------------------
 
 const IMAGE = 'node:22-slim';
@@ -269,9 +288,12 @@ const dockerSkipReason = (() => {
   if (image.status !== 0) return `image ${IMAGE} is not present locally (docker pull ${IMAGE})`;
   return undefined;
 })();
-if (dockerSkipReason) process.stderr.write(`[upstream-docker] skipping integration tests: ${dockerSkipReason}\n`);
+const requireDocker = process.env.REQUIRE_DOCKER === '1';
+if (dockerSkipReason && !requireDocker) {
+  process.stderr.write(`[upstream-docker] skipping integration tests: ${dockerSkipReason}\n`);
+}
 
-describe.skipIf(dockerSkipReason !== undefined)('upstream / docker integration', () => {
+describe.skipIf(dockerSkipReason !== undefined && !requireDocker)('upstream / docker integration', () => {
   const allowAll: FirewallPolicy = {
     defaultDecision: 'DENY',
     protectedPaths: [],
@@ -294,6 +316,7 @@ describe.skipIf(dockerSkipReason !== undefined)('upstream / docker integration',
   };
 
   beforeAll(async () => {
+    if (dockerSkipReason) throw new Error(`REQUIRE_DOCKER=1, but ${dockerSkipReason}`);
     dir = await realpath(await mkdtemp(join(tmpdir(), 'mcp-firewall-docker-it-')));
     upstream = await connectUpstream(
       { ...server, timeoutMs: 30_000 },

@@ -80,7 +80,7 @@ Other child-process choices:
 
 ## 7. Shutdown
 
-`src/index.ts` shuts down on agent disconnect, stdin end, `SIGINT` or `SIGTERM`. It closes the upstream, the proxy server and the monitor in parallel, waits at most 2 s, then exits 0. A downstream crash does **not** shut the proxy down: it keeps answering so that DENYs stay visible and allowed calls fail with a clear error.
+`src/index.ts` shuts down on agent disconnect, stdin end, `SIGINT` or `SIGTERM`. It closes the upstream, the proxy server and the monitor in parallel, waits at most 2 s, then exits 0. This only holds if the signal reaches our handler; see §13 for why `npm start` runs `node --import tsx`. A downstream crash does **not** shut the proxy down: it keeps answering so that DENYs stay visible and allowed calls fail with a clear error.
 
 ## 8. Claude Code launches the firewall via the repo's absolute `tsx`, not `npx`
 
@@ -90,6 +90,7 @@ The registered command is `<repo>/node_modules/.bin/tsx <repo>/src/index.ts --co
 - `npx tsx` looks for `tsx` in the `node_modules/.bin` of that directory's project. From the firewall repo itself that works. From any other project it either finds a different `tsx` (global or the project's own) or fetches an unpinned one from the registry. Fetching adds network time against Claude Code's 30 s connection timeout (the timeout is in its MCP log; the fetch time was not measured).
 - `<repo>/node_modules/.bin/tsx` is the version from `package-lock.json`, installed by `npm ci`. It gives the same result from any working directory and needs no network.
 - A relative `src/index.ts`, or a relative `--config`, would also resolve against the session's working directory. `src/index.ts` calls `resolve(values.config)`, so the config path must be absolute too. Paths *inside* the config (`server.cwd`) are resolved relative to the config file by the loader, and the default config is found via `import.meta.url`.
+- The `tsx` command relays signals to a child process and can SIGKILL it (§13). Claude Code normally stops the server by closing stdin, which is unaffected, but `<repo>/node_modules/.bin/tsx` could be replaced by `node --import <repo>/node_modules/tsx/dist/loader.mjs` to remove the relay. Not changed yet; the startup sweep (§13) covers a dir left behind.
 - Registration scope is separate from path resolution. `--scope local` stores the server for the folder `claude mcp add` was run in, so it only appears in sessions started there. Absolute paths make the command correct in *any* scope.
 
 ## 9. Staged writes: sandboxed downstream, diff after each call, apply only approved changes
@@ -165,3 +166,17 @@ Residual risk: Node has no `openat`, so a symlink swapped into a *parent* direct
 **Evaluator output is validated.** `evaluateFileChanges` gets a deep-frozen copy of the changes, so it can't alter what `apply` uses. Its output must be an array of the same length, each item must pass `ChangeDecisionSchema`, and paths must be in the same order. If it throws or returns anything else, every change is denied with `EVALUATION_ERROR`, the proxy's existing fail-closed rule ID (§4). A buggy evaluator then costs writes, never safety.
 
 **Events and results.** A FileChangeEvent is emitted only when a call, catch-up or startup actually produced changes. An allowed call that touched no files already appears as its FirewallEvent. Events keep at most 20 entries with paths cut to 200 characters, and `text` is never copied into them. The result's `_meta['mcp-firewall/staged']` lists at most 100 changes (`MAX_REPORTED_CHANGES`). `applied` and `rejected` stay true totals, and `truncated: true` is added when the list was cut. A downstream result is passed through with its content unchanged unless something was rejected; in that case one note block naming up to 100 rejected paths and rule IDs (then "...and N more") is appended.
+
+## 13. Run under `node --import tsx`; sweep stale staging dirs at startup
+
+**Why not the `tsx` command.** The `tsx` CLI runs the firewall in a child process and relays SIGINT/SIGTERM to it. For each signal it waits 30 ms for the child to acknowledge, then sends SIGKILL; concurrent relays share one waiter, so a second signal makes the first relay time out. Ctrl-C under `npm start` delivers SIGINT to npm, `tsx` and the firewall at once, and npm forwards it to `tsx` as well. The firewall was SIGKILLed before `shutdown()` ran, every time: the container still went away (`docker run --rm` loses its stdin), but the staging dir, a copy of the project, stayed in `$TMPDIR`. `node --import tsx` loads the same TypeScript loader in-process, so there is no relay, the handler runs, and cleanup completed in every trial. `dev` had no watch mode, so nothing was lost.
+
+**The sweep.** SIGKILL, a crash or power loss can still skip `dispose()`, so `sweepStaleStagingDirs()` runs once at startup, before the new staging dir is created. Each staging dir is now `mcp-firewall-staging-XXXXXX/{owner.json, tree/}`: `tree/` is the mirror (`stagingRoot`, mounted at `/workspace`), and `owner.json` holds the creating process's pid and start time. Keeping the owner file outside the mirror means scans, diffs and the server never see it.
+
+**The pid-file guard.** Several firewalls can run at once (Claude Code's instance next to a manual one), and deleting a live instance's mirror would wreck its staging. So the sweep removes a dir only when:
+- its name is exactly our prefix plus mkdtemp's six characters, in the staging parent (default `os.tmpdir()`);
+- `lstat` says it is a real directory (never a symlink, never followed) owned by our uid;
+- its owner file (opened with `O_NOFOLLOW`, at most 1 KiB, pid a positive integer, since `process.kill(0 or negative)` would signal a process group) names a pid for which `process.kill(pid, 0)` throws `ESRCH`. `EPERM` means the process exists, so the dir is kept;
+- or, with no usable owner file (older layout, or a crash before the file was written), its mtime is more than 24 hours old.
+
+A reused pid keeps a dead instance's dir until that process exits too: the guard errs toward keeping. The sweep logs the count and names only, and its failures are logged and never block startup.
