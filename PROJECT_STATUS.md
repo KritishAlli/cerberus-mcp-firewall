@@ -1,15 +1,15 @@
 # Project status: proxy and enforcement (Aarav)
 
-Merged to `main` (PR #2). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
+Merged to `main` (PRs #2, #7). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ## Done
 
 - **`src/proxy/interceptor.ts`**: `createInterceptor(deps)` does validate → clone + deep-freeze → evaluate (schema-checked, fail closed) → publish exactly one event → forward only on ALLOW. It returns a recognizable BLOCKED tool error on DENY and a fixed-message DOWNSTREAM ERROR when the downstream fails.
 - **`src/proxy/upstream.ts`**: `connectUpstream(config, { onClose? })` spawns the server over stdio with a safe default env and re-emits its stderr with a prefix. It has a connect timeout, per-call `timeout`/`maxTotalTimeout`/`signal`, paginated `listTools` (20-page cap), a `connected` getter, and `UpstreamUnavailableError` once closed. No reconnect.
 - **`src/proxy/server.ts`**: `startProxyServer(upstream, handler, { transport?, onClose? })` is a low-level `Server`. `tools/list` passes through unchanged, `tools/call` goes to the interceptor with the cancellation signal, and downstream `instructions` are not forwarded.
-- **`src/index.ts`**: passes the signal through, and shuts down cleanly on agent disconnect, stdin end, SIGINT or SIGTERM (2 s cap). A downstream crash keeps the proxy up and fails closed.
+- **`src/index.ts`**: passes the signal through, and shuts down cleanly on agent disconnect, stdin end, SIGINT or SIGTERM (2 s cap), closing the upstream, proxy and monitor. A downstream crash keeps the proxy up and fails closed. Kritish's PR #6 added one line wiring `/health` to live state: `monitor?.setProtectedServers(() => (upstream.connected ? 1 : 0))`. Reviewed: correct, and the optional chaining keeps enforcement independent of the monitor.
 - **`tests/fixtures/counting-server.ts`**: test-only stdio server (`echo`, `read_file`, `structured`, `tool_error`, `hang`, `crash`, `get_call_counts`) with an optional `--counts-file`.
-- **`tests/proxy.test.ts`**: 66 tests in tests/proxy.test.ts; full suite 90 passing (incl. 10 shared contract and 12 security tests), 8 todo (all in `tests/e2e.test.ts`). Coverage:
+- **`tests/proxy.test.ts`**: 67 tests in tests/proxy.test.ts; full suite 115 passing (67 proxy, 10 contract, 14 security, 16 events, 8 monitor), 8 todo (all in `tests/e2e.test.ts`). Coverage:
   - unit tests (T01, T02, T06, T09, T11, fail-closed evaluator and publish, arg mutation, summary bounds, signal)
   - integration through the real stdio fixture (listing identical to direct, T01/T02 counts, structured results and tool errors, unknown tools, hang timeout, crash)
   - CLI smoke test of `src/index.ts`. With the real evaluator, its approved `fixture/echo` call now takes the forwarded (ALLOW) branch.
@@ -17,6 +17,7 @@ Merged to `main` (PR #2). Rationale for each choice: [`docs/DECISIONS.md`](docs/
     - listing parity with a direct connection
     - T01: `read_project_file` is ALLOWed, forwarded once, and its result is identical to a direct call
     - T02–T04: PROTECTED_PATH, DENIED_DESTINATION and DENIED_TOOL are each BLOCKED with a count of 0
+  - vertical slice (T10): the real CLI with its monitor on a free port. One allowed and one denied call, then `GET /events` replays exactly those two events (decision, ruleId, matching `requestId`), `counts` is `{inspected: 2, allowed: 1, denied: 1}`, `/health` is `{status: ok, protectedServers: 1}`, and no argument values or the mock's secret appear in the stream (T11)
 
 ## Claude Code setup (verified)
 
@@ -30,6 +31,9 @@ Merged to `main` (PR #2). Rationale for each choice: [`docs/DECISIONS.md`](docs/
 | Downstream counts | ✔ all 0 (or file absent): nothing reached the mock |
 | Shutdown | ✔ after `/exit`, `pgrep -fl "counting-server\|src/index.ts"` returns nothing |
 | ALLOW path (T01) | ✔ with the real evaluator, `read_project_file` on `README.md` returns the demo README as a normal result. The counts file shows `read_project_file: 1` with the other three tools at 0, and the MCP log has one `ALLOW APPROVED_TOOL` event. **T01 works end to end through a real Claude Code client.** |
+| Live monitor (T10) | ✔ verified on 2026-10-23 in a real Claude Code session. `read_project_file` on `README.md` showed up at `http://127.0.0.1:3000` as ALLOW / APPROVED_TOOL without refreshing, and the counters updated. |
+
+- **Monitor note:** the dev config at `~/.config/mcp-firewall-dev/firewall.yaml` must have `monitor.enabled: true` (an old copy had it `false`). A Claude Code session and `npm run demo -- --hold` both default to port 3000, and only one monitor can hold the port at a time. Close Claude Code before running the demo with `--hold`, or set a different port in that file, e.g. `monitor: { enabled: true, port: 3001 }`.
 
 The exact command that worked. It was run from the repo root, so `$PWD` is the repo:
 
@@ -43,7 +47,18 @@ claude mcp add --scope local mcp-firewall-dev -- "$PWD/node_modules/.bin/tsx" "$
 - **For the README (Kritish):** the same command with the shipped config is `claude mcp add --scope local mcp-firewall -- "$PWD/node_modules/.bin/tsx" "$PWD/src/index.ts" --config "$PWD/config/firewall.yaml"`, run from the repo root.
 - **Claude Code's own classifier can refuse a call before it reaches the firewall.** In the session, Claude Code's auto-mode classifier refused a Claude-driven `read_sensitive_file` call itself, so it never reached the firewall and isn't a firewall result. **The firewall's DENY must be shown with the direct-client demo (`npm run demo`)**, which always sends the call. Don't rely on Claude choosing to make it.
 - **Where the firewall's stderr goes (macOS):** `~/Library/Caches/claude-cli-nodejs/<project-path-with-dashes>/mcp-logs-<server-name>/<timestamp>.jsonl`. Claude Code tags each stderr chunk as `"error": "Server stderr: …"`. That is its label for stderr, not a failure. Our event JSON lines and `[firewall] …` diagnostics appear there. The log also records the session `cwd`, the 30 s connection timeout, and the SIGINT sent at shutdown.
-- **README is stale (Kritish):** the "Status: scaffold … The proxy, policy engine, monitor and demo are stubs" line is out of date. The proxy, mock server and demo are all on `main` now.
+- **README is stale (Kritish):** the "Status: scaffold … The proxy, policy engine, monitor and demo are stubs" line is out of date. The proxy, evaluator, mock server, demo and monitor are all on `main` now.
+
+## Vertical slice (proxy → evaluator → event bus → monitor SSE): verified
+
+Verified on 2026-10-23 with `npm run demo -- --hold` on `main` at `df3c8b5`, using the shipped `config/firewall.yaml`:
+
+- **`/health`**: `{"status":"ok","protectedServers":1}` (HTTP 200), read from live upstream state.
+- **`/events`**: replayed the demo's four decisions in order, followed by `ready {replayed: 4}`. They were ALLOW APPROVED_TOOL, DENY PROTECTED_PATH, DENY DENIED_DESTINATION and ALLOW APPROVED_TOOL (the repeated read), with counts `{inspected: 4, allowed: 2, denied: 2}`. The demo never calls `delete_file`, so no DENIED_TOOL event appears there. DENIED_TOOL is covered by the mock integration test.
+- **T11**: the SSE output contains none of `credentials`, `~/.aws`, `example-attacker`, `collect`, `README.md`, `stolen`, `aws_access_key_id` or `AKIA-DUMMY`. Events carry argument key names only.
+- **Shutdown**: SIGINT to the demo stopped the demo, firewall and mock, and freed port 3000, with no leftover processes.
+- **Port collision**: a second firewall started with the shipped config while the first held port 3000. It logged `monitor failed to start; enforcement continues: … EADDRINUSE …`, kept enforcing, returned `BLOCKED (PROTECTED_PATH)` for a protected read, and forwarded an approved read normally. Fail-safe works as §6.6 requires.
+  - **Its events reach only its own stderr.** The monitor on 3000 belongs to the first instance, so the browser shows only that instance's events and its `/health`. That is easy to misread as "both sessions are monitored".
 
 ## Interfaces teammates should know about
 
@@ -64,7 +79,7 @@ From `src/proxy/interceptor.ts`:
 
 - ~~`src/security/evaluator.ts` is the deny-all stub~~: Winston's real evaluator landed on `main` in PR #4 (`40ea8e4`). With the shipped policy it returns ALLOW / PROTECTED_PATH / DENIED_DESTINATION / DENIED_TOOL for the four demo calls, consistent with design §7.
 - ~~`demo/mock-server.ts` is a stub~~: landed in PR #3 (`6a7f51d`).
-- **Release gate (§10): all three commands pass** on this machine: `npm run typecheck`, `npm test` (90 passed, 8 todo) and `npm run demo` (DEMO PASSED, all 12 checks).
+- **Release gate (§10): all three commands pass** on this machine: `npm run typecheck`, `npm test` (115 passed, 8 todo) and `npm run demo` (DEMO PASSED, all 12 checks).
 - **Open policy issues for Winston** (found in a read-only review; no proxy change needed):
   - case-variant protected paths are allowed on macOS
   - relative-path traversal is not resolved
@@ -73,7 +88,6 @@ From `src/proxy/interceptor.ts`:
 
   They don't affect the scripted demo, whose mock never touches the disk, but they are real holes for any downstream that does read files.
 - **Still open (Kritish):**
-  - the monitor is a stub
   - `tests/e2e.test.ts` is 8 todos
   - the README status line and Claude Code TODO are stale
   - the demo detects blocks by parsing prose rather than `_meta`
@@ -94,7 +108,8 @@ From `src/proxy/interceptor.ts`:
 2. ~~Re-run the manual Claude Code check with the real evaluator~~: done. T01 verified end to end in Claude Code.
 3. Winston: address the policy issues above (path case-folding on macOS, relative-path handling, `file://` and trailing-slash normalization), then re-run `npm run check`. The mock integration test should keep passing unchanged.
 4. Kritish:
-   - implement the monitor and `tests/e2e.test.ts`
+   - implement `tests/e2e.test.ts`
    - move "Claude Code setup (verified)" into the README and fix the stale status line
    - switch the demo's block detection to `_meta['mcp-firewall/decision']`
-5. Optional, after acceptance tests: forward `list_changed`, and a shutdown hook for the monitor once it holds real resources.
+5. ~~Shutdown hook for the monitor~~: already in place. `src/index.ts` closes it on shutdown, and port 3000 is freed after SIGINT.
+6. Optional, after acceptance tests: forward `list_changed`. Consider logging a clearer warning when the monitor port is taken, e.g. "events from this instance will not appear in the browser", and logging only the error code instead of the full `EADDRINUSE` object and stack.
