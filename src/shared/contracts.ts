@@ -61,6 +61,8 @@ export const RULE_IDS = [
   'DENIED_DESTINATION',
   'DESTRUCTIVE_ACTION',
   'APPROVED_TOOL',
+  /** A human approved one specific DENY for one request in the terminal. */
+  'USER_APPROVED_OVERRIDE',
   'DEFAULT_DENY',
   /**
    * Not produced by the evaluator. Used by the proxy when evaluation itself

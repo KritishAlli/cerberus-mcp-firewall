@@ -19,7 +19,13 @@ interface ArgumentString {
   value: string;
   isPathArgument: boolean;
   isDestinationArgument: boolean;
+  isContent: boolean;
 }
+
+// These fields carry text or file payloads, not paths to operate on. Scanning
+// their source text as if it were a requested filesystem path rejects normal
+// code containing comments, URLs, or examples such as `/etc/hosts`.
+const contentArgumentNames = new Set(['content', 'contents', 'text', 'body', 'oldtext', 'newtext']);
 
 function collectStrings(
   value: unknown,
@@ -28,20 +34,27 @@ function collectStrings(
   output: ArgumentString[],
   inheritedPath = false,
   inheritedDestination = false,
+  inheritedContent = false,
 ): boolean {
   if (typeof value === 'string') {
-    output.push({ value, isPathArgument: inheritedPath, isDestinationArgument: inheritedDestination });
+    output.push({
+      value,
+      isPathArgument: inheritedPath,
+      isDestinationArgument: inheritedDestination,
+      isContent: inheritedContent,
+    });
     return true;
   }
   if (Array.isArray(value)) {
-    return value.every((item) => collectStrings(item, pathNames, destinationNames, output, inheritedPath, inheritedDestination));
+    return value.every((item) => collectStrings(item, pathNames, destinationNames, output, inheritedPath, inheritedDestination, inheritedContent));
   }
   if (isPlainRecord(value)) {
     let valid = true;
     for (const [key, item] of Object.entries(value)) {
       const isPath = inheritedPath || pathNames.has(key);
       const isDestination = inheritedDestination || destinationNames.has(key);
-      if (!collectStrings(item, pathNames, destinationNames, output, isPath, isDestination)) valid = false;
+      const isContent = inheritedContent || contentArgumentNames.has(key.toLowerCase());
+      if (!collectStrings(item, pathNames, destinationNames, output, isPath, isDestination, isContent)) valid = false;
     }
     return valid;
   }
@@ -83,7 +96,7 @@ function isNetworkTool(request: ToolCallContext, policy: FirewallPolicy, values:
   const tokens = nameTokens(request.toolName);
   return Object.hasOwn(policy.destinationArgs, canonical)
     || [...tokens].some((token) => networkNameTokens.has(token))
-    || values.some((item) => extractUrlReferences(item.value).length > 0);
+    || values.some((item) => (!item.isContent || item.isDestinationArgument) && extractUrlReferences(item.value).length > 0);
 }
 
 export function isSensitiveToolName(toolName: string): boolean {
@@ -96,6 +109,7 @@ export function matchDeniedTool(request: ToolCallContext, policy: FirewallPolicy
 }
 
 function pathCandidates(item: ArgumentString): string[] {
+  if (!item.isPathArgument && item.isContent) return [];
   const fileUrls = extractUrlReferences(item.value).filter((ref) => ref.value.toLowerCase().startsWith('file://'));
   if (fileUrls.length > 0) {
     return fileUrls.flatMap((ref) => {
@@ -167,7 +181,7 @@ export function matchDeniedDestination(request: ToolCallContext, policy: Firewal
       const refs = extractUrlReferences(item.value);
       if (refs.length > 0) destinations.push(...refs.map((r) => r.value));
       else destinations.push(item.value.trim());
-    } else {
+    } else if (!item.isContent) {
       destinations.push(...extractUrlReferences(item.value).map((r) => r.value));
     }
   }

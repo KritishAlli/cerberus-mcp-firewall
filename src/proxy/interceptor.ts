@@ -32,6 +32,7 @@ import {
   type ToolCallContext,
 } from '../shared/contracts.js';
 import { runStagedCall, type StagingDeps } from './staged-call.js';
+import type { TerminalApproval } from './terminal-approval.js';
 
 /** Start of the text of every DENY result. Stable: tests and the demo match on it. */
 export const BLOCKED_PREFIX = '[MCP Firewall] BLOCKED';
@@ -71,6 +72,8 @@ export interface InterceptorDeps {
   getSession?: () => SessionContext;
   /** Staged writes for a sandboxed server. Without it, allowed calls are forwarded as before. */
   staging?: StagingDeps;
+  /** Optional one-request terminal approval path. Missing or unavailable terminal keeps DENYs. */
+  terminalApproval?: TerminalApproval;
 }
 
 /** toolName and rawArgs are untrusted and validated here, hence `unknown`. */
@@ -103,7 +106,16 @@ export function createInterceptor(deps: InterceptorDeps): ToolCallHandler {
     const displayName = typeof toolName === 'string' && isIdentifier(toolName) ? sanitize(toolName) : INVALID_TOOL_NAME;
 
     const prepared = prepareContext(requestId, deps.serverId, toolName, rawArgs, readSession(deps.getSession));
-    const decision = prepared.ok ? evaluateSafely(prepared.ctx, deps, log, requestId) : prepared.decision;
+    let decision = prepared.ok ? evaluateSafely(prepared.ctx, deps, log, requestId) : prepared.decision;
+    if (prepared.ok && decision.decision === 'DENY' && decision.ruleId !== 'EVALUATION_ERROR' && decision.ruleId !== 'INVALID_ARGUMENTS') {
+      if (await deps.terminalApproval?.policy(requestId, displayName, decision)) {
+        decision = {
+          decision: 'ALLOW',
+          ruleId: 'USER_APPROVED_OVERRIDE',
+          reason: `User approved one-time override of ${decision.ruleId}: ${decision.reason}`.slice(0, 200),
+        };
+      }
+    }
 
     publishSafely(
       () => ({

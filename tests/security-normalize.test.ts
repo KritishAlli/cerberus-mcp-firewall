@@ -77,6 +77,30 @@ describe('path and destination security normalization', () => {
     }), basePolicy)).toMatchObject({ decision: 'DENY', ruleId: 'PROTECTED_PATH' });
   });
 
+  it('does not treat source text in write payloads as requested paths or destinations', () => {
+    const result = evaluateToolCall(request({
+      path: '/workspace/src/sub/example.ts',
+      content: '// ordinary comment\n// See /etc/hosts for an example\nconst endpoint = "https://example.com";\n',
+    }, { toolName: 'write_file' }), {
+      ...basePolicy,
+      approvedTools: ['fs/write_file'],
+      writeTools: ['fs/write_file'],
+    });
+    expect(result).toMatchObject({ decision: 'ALLOW', ruleId: 'APPROVED_TOOL' });
+  });
+
+  it('continues scanning write payloads for credential material', () => {
+    const result = evaluateToolCall(request({
+      path: '/workspace/src/example.ts',
+      content: 'const key = "AKIA1234567890ABCDEF";\n',
+    }, { toolName: 'write_file' }), {
+      ...basePolicy,
+      approvedTools: ['fs/write_file'],
+      writeTools: ['fs/write_file'],
+    });
+    expect(result).toMatchObject({ decision: 'DENY', ruleId: 'SECRET_DETECTED' });
+  });
+
   it('rejects malformed or non-HTTP URL schemes for configured destination tools', () => {
     expect(evaluateToolCall(request({ url: 'javascript:alert(1)' }, { toolName: 'send_data' }), {
       ...basePolicy,
