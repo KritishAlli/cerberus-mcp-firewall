@@ -128,7 +128,7 @@ export const DockerLaunchSchema = z.strictObject({
     .string()
     .regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]*(?::[A-Za-z0-9_][A-Za-z0-9_.-]*)?$/, 'user must be "uid:gid" or a user name')
     .optional(),
-  /** Docker memory limit, e.g. "512m". Default 512m. */
+  /** Docker memory limit, e.g. "512m", also set as --memory-swap (no swap). Default 512m. */
   memory: z
     .string()
     .regex(/^[1-9][0-9]*[bkmg]?$/i, 'memory must look like "512m"')
@@ -208,6 +208,7 @@ export function buildDockerArgs(
   const ownerPid = options.ownerPid ?? process.pid;
   if (!Number.isInteger(ownerPid) || ownerPid < 1) throw new LaunchConfigError('invalid owner pid');
   const workspace = mountSource(l.workspaceDir, 'workspaceDir');
+  const memory = l.memory ?? '512m';
 
   // [flag, value] pairs before the image. Every value is checked not to look like a flag.
   const flags: [string, string][] = [
@@ -217,7 +218,9 @@ export function buildDockerArgs(
     ['--security-opt', 'no-new-privileges'],
     ['--user', l.user ?? defaultUser()],
     ['--pids-limit', String(l.pidsLimit ?? 128)],
-    ['--memory', l.memory ?? '512m'],
+    ['--memory', memory],
+    // Equal to --memory: no swap on top of the limit (Docker's default allows as much again).
+    ['--memory-swap', memory],
     ['--tmpfs', '/tmp:rw,noexec,nosuid,size=64m'],
     ['--mount', `type=bind,src=${workspace},dst=/workspace`],
   ];
@@ -537,8 +540,10 @@ export async function connectUpstream(
     },
     async close() {
       connected = false;
-      await client.close();
+      // Container first: a server that ignores stdin EOF would otherwise hold client.close()
+      // until shutdown's 2 s cap, before the staging dir is disposed.
       await container?.removeNow();
+      await client.close();
     },
   };
 }
