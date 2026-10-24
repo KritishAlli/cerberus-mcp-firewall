@@ -20,6 +20,10 @@
  *   - FirewallPolicy gains an optional `staging` section.
  *   - RuleId gains the staging rule IDs (WRITE_NOT_ALLOWED … WRITE_CONFLICT).
  *   - EvaluateFileChanges is the Winston → Aarav signature for staged changes.
+ *
+ * Sandbox config (kritish/sandbox-config; additive only):
+ *   - DownstreamServer gains an optional `sandbox` section (SandboxConfig).
+ *     src/config/load.ts maps it onto UpstreamLaunch (src/proxy/upstream.ts).
  */
 import { z } from 'zod';
 
@@ -261,6 +265,34 @@ export type FileChangeEvent = z.infer<typeof FileChangeEventSchema>;
 // FirewallConfig — the whole YAML file (loader owned by Kritish)
 // ---------------------------------------------------------------------------
 
+/** Docker image reference. Restricted so it can never be read as a docker flag or split into several args. */
+const dockerImage = z
+  .string()
+  .max(255)
+  .regex(/^[a-z0-9][a-z0-9._/:@-]*$/, 'image must be a docker image reference such as "mcp-firewall-sandbox:latest"');
+
+export const SandboxConfigSchema = z.strictObject({
+  /** Image the downstream server runs in. Missing image = refuse to start (no fallback). */
+  image: dockerImage,
+  /** Protected project (relative to the config file). The server only ever sees a staging copy of it. */
+  project: z.string().min(1),
+  /** Server code mounted read-only at /server (relative to the config file). Omit if the image holds it. */
+  serverDir: z.string().min(1).optional(),
+  /** The only environment the container gets. Nothing from the host is passed through. */
+  env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'env names must be [A-Za-z_][A-Za-z0-9_]*'), z.string()).optional(),
+  /** "uid:gid" inside the container. Default: the host uid:gid. Root (uid 0) is refused. */
+  user: z
+    .string()
+    .regex(/^\d+:\d+$/, 'user must be "uid:gid"')
+    .refine((u) => Number(u.split(':')[0]) !== 0, 'user must not be root')
+    .optional(),
+  /** Docker --memory. */
+  memory: z.string().regex(/^\d+[kmg]$/, 'memory must look like "512m"').default('512m'),
+  /** Docker --pids-limit. */
+  pidsLimit: z.number().int().min(1).max(4096).default(128),
+});
+export type SandboxConfig = z.infer<typeof SandboxConfigSchema>;
+
 export const DownstreamServerSchema = z.strictObject({
   /** Becomes ToolCallContext.serverId and the prefix of canonical tool names. */
   id: z.string().regex(/^[A-Za-z0-9_-]+$/, 'server id must be [A-Za-z0-9_-]+').max(LIMITS.identifier),
@@ -271,6 +303,12 @@ export const DownstreamServerSchema = z.strictObject({
   cwd: z.string().optional(),
   /** Per-call timeout before failing closed (§6.4). */
   timeoutMs: z.number().int().positive().default(10_000),
+  /**
+   * Run command/args inside Docker against a staging copy of `project`
+   * (docs/STAGED_WRITES_PLAN.md). Requires policy.staging. cwd is not allowed
+   * with it: the container's working directory is /workspace.
+   */
+  sandbox: SandboxConfigSchema.optional(),
 });
 export type DownstreamServerConfig = z.infer<typeof DownstreamServerSchema>;
 
