@@ -6,7 +6,9 @@
  *                   `firewall` frames carry FirewallEvents; `filechanges` frames carry
  *                   FileChangeEvents plus a ready-made `line` (paths and rule IDs, never contents);
  *                   `counts` frames carry EventCounts after every live event of either kind.
- *   GET /health   → { status, protectedServers } from live upstream state
+ *   GET /health   → { status, protectedServers, instance } from live upstream state. `instance`
+ *                   (pid, start time) says WHICH gateway process this monitor belongs to: only
+ *                   one process can hold the port, and a second gateway's events never reach it.
  *
  * Binds to config.host (127.0.0.1 only) and rejects requests whose Host header is
  * not loopback, so a DNS-rebinding page cannot read the feed. A monitor failure must
@@ -43,7 +45,38 @@ export interface MonitorHandle {
 export interface HealthBody {
   status: 'ok' | 'degraded';
   protectedServers: number;
+  /** The gateway process serving this monitor, so a page or script can tell instances apart. */
+  instance: GatewayInstance;
 }
+
+export interface GatewayInstance {
+  pid: number;
+  /** ISO 8601 start time of the gateway process. */
+  startedAt: string;
+}
+
+/**
+ * The port is held by another process, usually another firewall instance. This
+ * gateway still enforces policy; its events go only to its own stderr.
+ */
+export class MonitorPortInUseError extends Error {
+  override name = 'MonitorPortInUseError';
+  constructor(readonly url: string) {
+    super(
+      `${url} is already in use, probably by another firewall instance. ` +
+        `This gateway (pid ${process.pid}) still enforces policy, but its events will NOT appear on that monitor: ` +
+        `they go only to this process's stderr. Stop the other instance or give this config another monitor.port.`,
+    );
+    // The message is the whole story; a stack trace would only bury it in the client's log.
+    this.stack = `${this.name}: ${this.message}`;
+  }
+}
+
+/** Computed once: the process start time does not change. */
+const instance: GatewayInstance = Object.freeze({
+  pid: process.pid,
+  startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+});
 
 export async function startMonitor(config: MonitorConfig, options: MonitorOptions = {}): Promise<MonitorHandle> {
   const bus = options.bus ?? eventBus;
@@ -150,10 +183,15 @@ export async function startMonitor(config: MonitorConfig, options: MonitorOption
   app.notFound((c) => c.text('Not found', 404));
   app.onError((_err, c) => c.text('Internal error', 500));
 
-  const server = await listen(app, config);
+  const server = await listen(app, config).catch((err: unknown) => {
+    if ((err as NodeJS.ErrnoException | undefined)?.code === 'EADDRINUSE') {
+      throw new MonitorPortInUseError(`http://${config.host}:${config.port}`);
+    }
+    throw err;
+  });
   port = (server.address() as AddressInfo).port;
   const url = `http://${config.host}:${port}`;
-  process.stderr.write(`[firewall] monitor listening on ${url}\n`);
+  process.stderr.write(`[firewall] monitor listening on ${url} (gateway pid ${instance.pid})\n`);
 
   return {
     url,
@@ -177,7 +215,7 @@ function health(protectedServers: () => number): HealthBody {
   } catch {
     // Treat a failing status source as nothing protected.
   }
-  return { status: count >= 1 ? 'ok' : 'degraded', protectedServers: count };
+  return { status: count >= 1 ? 'ok' : 'degraded', protectedServers: count, instance };
 }
 
 function listen(app: Hono, config: MonitorConfig): Promise<ServerType> {

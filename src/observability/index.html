@@ -3,6 +3,9 @@
   OWNER: Kritish — live, read-only monitor UI (design doc §8).
   Plain HTML/CSS/JS, no React. Uses EventSource('/events').
   Shows ONLY real events and counters: no prepopulated numbers or fake green status.
+  Two separate statuses: whether THIS page is connected to a monitor (and which gateway
+  process, by pid), and whether that gateway has a live downstream server. Only one
+  process can hold the port, so another gateway's calls never show up here.
   Every event field is rendered with textContent, never innerHTML.
   File-change events show counts, paths and rule IDs only: they never carry contents.
 -->
@@ -51,9 +54,12 @@
       main { max-width: 1000px; margin: 0 auto; }
       header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; justify-content: space-between; }
       h1 { margin: 0; font-size: 20px; }
-      #status { color: var(--muted); }
-      #status.ok { color: var(--allow); }
-      #status.bad { color: var(--warn); }
+      .statuses { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; font-size: 13px; }
+      .statuses span { color: var(--muted); }
+      .statuses .ok { color: var(--allow); }
+      .statuses .bad { color: var(--warn); }
+      #notice { margin: 12px 0 0; padding: 8px 12px; border-radius: 8px; color: var(--warn); background: var(--warn-bg); }
+      main.stale .counters, main.stale .table-wrap { opacity: 0.55; }
       .counters { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0; }
       @media (max-width: 560px) { .counters { grid-template-columns: repeat(2, 1fr); } }
       .counter { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
@@ -73,7 +79,8 @@
       .badge.ALLOW { color: var(--allow); background: var(--allow-bg); }
       .badge.DENY { color: var(--deny); background: var(--deny-bg); }
       .badge.BLOCKED { color: var(--warn); background: var(--warn-bg); }
-      .rule { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; }
+      .rule, .request { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; }
+      .request { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
       #empty { padding: 24px; text-align: center; color: var(--muted); }
       tr.files td { padding-top: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-word; }
       tr.files td.line { color: var(--allow); }
@@ -87,8 +94,12 @@
     <main>
       <header>
         <h1>MCP Firewall</h1>
-        <span id="status">Connecting…</span>
+        <div class="statuses">
+          <span id="monitor-status">Monitor: connecting…</span>
+          <span id="gateway-status">Gateway: unknown</span>
+        </div>
       </header>
+      <p id="notice" hidden></p>
 
       <section class="counters" aria-label="Counters">
         <div class="counter"><span>Inspected</span><strong id="inspected">–</strong></div>
@@ -112,7 +123,10 @@
       const MAX_ROWS = 500;
       const feed = document.getElementById('feed');
       const empty = document.getElementById('empty');
-      const statusEl = document.getElementById('status');
+      const main = document.querySelector('main');
+      const monitorStatus = document.getElementById('monitor-status');
+      const gatewayStatus = document.getElementById('gateway-status');
+      const notice = document.getElementById('notice');
 
       function cell(className, text) {
         const td = document.createElement('td');
@@ -139,7 +153,12 @@
         tr.appendChild(decision);
 
         tr.appendChild(cell('', event.reason));
-        tr.appendChild(cell('summary', event.summary));
+        const summary = cell('summary', event.summary);
+        const request = document.createElement('span');
+        request.className = 'request';
+        request.textContent = 'request ' + event.requestId;
+        summary.appendChild(request);
+        tr.appendChild(summary);
         feed.prepend(tr);
         trimFeed();
         empty.hidden = true;
@@ -205,28 +224,55 @@
         document.getElementById('writesBlocked').textContent = counts.writesBlocked;
       }
 
-      // "Live" needs both: the event stream is open AND /health says a server is protected.
+      // The monitor connection and the gateway's protection are reported separately:
+      // a closed stream says nothing about enforcement, and an open one is not "protected".
       let streamOpen = false;
       let health = null; // last /health body, or null if unreachable
+      let instance = null; // { pid, startedAt } of the gateway this page last talked to
+
+      function setStatus(el, ok, text) {
+        el.className = ok ? 'ok' : 'bad';
+        el.textContent = text;
+      }
 
       function renderStatus() {
-        let ok = false;
-        let text;
-        if (!streamOpen) text = 'Disconnected, retrying…';
-        else if (!health) text = 'Firewall unreachable';
-        else if (health.status !== 'ok') text = 'No downstream server connected';
-        else {
-          ok = true;
-          const n = health.protectedServers;
-          text = 'Live · protecting ' + n + ' server' + (n === 1 ? '' : 's');
+        main.classList.toggle('stale', !streamOpen);
+        if (!streamOpen) {
+          setStatus(monitorStatus, false, 'Monitor: disconnected, retrying… (showing last known data)');
+        } else if (!health) {
+          setStatus(monitorStatus, false, 'Monitor: event stream open, /health unreachable');
+        } else {
+          const started = new Date(health.instance.startedAt).toLocaleTimeString();
+          setStatus(monitorStatus, true, 'Monitor: live · gateway pid ' + health.instance.pid + ', started ' + started);
+          // Zero rows is honest only for THIS process; say so, since the usual cause is a second gateway.
+          empty.textContent =
+            'No tool calls through gateway pid ' + health.instance.pid + ' yet. ' +
+            'Calls handled by another firewall process (for example one whose monitor port was taken) are not shown here.';
         }
-        statusEl.className = ok ? 'ok' : 'bad';
-        statusEl.textContent = text;
+        if (!streamOpen || !health) {
+          setStatus(gatewayStatus, false, 'Gateway: unknown from here (enforcement does not depend on this page)');
+        } else if (health.status !== 'ok') {
+          setStatus(gatewayStatus, false, 'Gateway: no downstream server connected (allowed calls fail closed)');
+        } else {
+          const n = health.protectedServers;
+          setStatus(gatewayStatus, true, 'Gateway: protecting ' + n + ' server' + (n === 1 ? '' : 's'));
+        }
+      }
+
+      function noteInstance(next) {
+        if (instance && (instance.pid !== next.pid || instance.startedAt !== next.startedAt)) {
+          notice.textContent =
+            'Now showing a different gateway process (pid ' + instance.pid + ' → ' + next.pid +
+            '). Events from the previous one are not shown.';
+          notice.hidden = false;
+        }
+        instance = next;
       }
 
       async function refreshHealth() {
         try {
           health = await (await fetch('/health')).json();
+          noteInstance(health.instance);
         } catch {
           health = null;
         }

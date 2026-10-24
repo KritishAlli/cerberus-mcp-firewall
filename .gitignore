@@ -18,3 +18,12 @@ node_modules/
 
 # Test coverage
 coverage/
+
+# Per-developer firewall configs (docs/SETUP.md §2): local paths and policy, never shared
+config/*.local.yaml
+
+# Claude Code per-user settings
+.claude/settings.local.json
+
+# Scratch scripts
+*.tmp.ts

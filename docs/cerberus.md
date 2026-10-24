@@ -16,7 +16,7 @@
 
 **Not a universal endpoint firewall:** Cerberus protects only calls that a supported client routes through it. It does not automatically intercept built-in shell/editor tools, direct MCP connections that bypass the proxy, arbitrary host processes, or network requests from servers not contained by its Docker sandbox. Do not claim otherwise.
 
-**Current state:** The repo already has an MCP gateway, policy evaluation, Docker launch path, staged filesystem writes, and a loopback monitor. Client-side setup/onboarding and a blocked-action dialog are future product work. The monitor reporting zero events while a tool call is enforced has been observed and needs diagnosis; treat different-process explanations as hypotheses until verified.
+**Current state:** The repo already has an MCP gateway, policy evaluation, Docker launch path, staged filesystem writes, and a loopback monitor. Client setup for Claude Code and Codex is documented in [`SETUP.md`](SETUP.md); a blocked-action dialog is future product work. The monitor reporting zero events while a tool call is enforced was diagnosed on 2026-10-24 as an instance mismatch: a second gateway can't bind the monitor port, keeps enforcing, and its events never reach the first gateway's page (see [`SETUP.md`](SETUP.md#zero-events-on-the-monitor)).
 
 # 2. Architecture and trust boundaries
 
@@ -136,52 +136,11 @@ Do not show raw arguments or secret values. Do not present a green success state
 
 # 7. User setup for the current prototype
 
-The repo currently provides a usable sandbox demo, not a polished installer. Use a disposable project and dummy credentials.
+The setup, check, troubleshooting and removal guide is [`docs/SETUP.md`](SETUP.md). It replaces the Codex-only notes that were here. Summary of what changed and why:
 
-## 7.1 Build and run
-
-From the inner `mcp-firewall` directory:
-
-```bash
-nvm use
-npm ci
-npm run sandbox:build
-node --import tsx src/index.ts --config config/sandbox.yaml
-```
-
-The command runs a stdio MCP gateway and should remain active while connected. The monitor is at `http://127.0.0.1:3000/`. Stop a manually started instance with Ctrl+C after disconnecting the client. Do not run a manual process alongside a client-managed instance using the same monitor port.
-
-`config/sandbox.yaml` targets the disposable `demo/project`. Before using another project, back it up and review `server.sandbox.project`, `policy.staging.writablePaths`, `policy.staging.protectedWritePaths`, `policy.protectedPaths`, and tool policy. Docker must be available, and the image must be built locally. The firewall refuses to start if these requirements are not met.
-
-## 7.2 Configure Codex on the current development machine
-
-Add this MCP server to `~/.codex/config.toml`, adapting absolute paths to the local checkout. The Node path shown is the verified executable for the current development setup:
-
-```toml
-[mcp_servers.mcp_firewall]
-command = "/Users/winstonluo/.nvm/versions/node/v22.23.4/bin/node"
-args = [
-  "--import", "tsx",
-  "/Users/winstonluo/Documents/programming/mcp-firewall/mcp-firewall/src/index.ts",
-  "--config", "/Users/winstonluo/Documents/programming/mcp-firewall/mcp-firewall/config/sandbox.yaml"
-]
-```
-
-Install dependencies first so `--import tsx` resolves. Restart Codex and confirm `mcp_firewall` is connected. Do not use a guessed Node path; use the Node 22 executable installed on that machine. This example is specific to this checkout and is not a general installer.
-
-## 7.3 Verify and troubleshoot
-
-Ask the agent to use only `mcp_firewall`:
-
-1. List `/workspace` and summarize it. This is the safe baseline.
-2. Attempt `read_text_file` on `/workspace/.env`, without trying another path. Confirm it is denied and record the rule ID.
-3. List `/Users/winstonluo/Documents/programming/mcp-firewall/mcp-firewall/demo/test-downloads`. This should be outside the container's allowed root and denied.
-
-If the monitor reports a live server but zero events, stop any manually launched process, close other Codex tasks, fully restart Codex, then repeat the safe listing while watching the monitor. If it still shows zero, capture firewall stderr and the exact MCP server configuration. Treat process mismatch as an unconfirmed hypothesis. A successful deny response proves enforcement for that request; it does not prove the monitor is receiving events.
-
-## 7.4 Remove the current integration
-
-Remove only the `[mcp_servers.mcp_firewall]` entry from `~/.codex/config.toml`, preserving unrelated entries, then restart Codex. Stop any manually running gateway. Removing the MCP entry disconnects the client; it does not delete project files or the repository.
+- **Commands come from a preview, not a copied example.** `node --import tsx src/config/client-setup.ts` prints the exact Claude Code command and Codex TOML for the local machine (Node path, repo path, config), after checking Node, tsx, Docker and the image. It never writes client config: `claude mcp add/remove` edits only its own entry, and Codex's TOML is edited by hand after a backup.
+- **tsx is imported by absolute file URL.** The earlier example's bare `--import tsx` resolves against the client's working directory and fails with `ERR_MODULE_NOT_FOUND` when the agent starts outside the repo (reproduced 2026-10-24).
+- **Zero events, diagnosed.** Reproduced with two real gateways: the second gets `EADDRINUSE`, still enforces, and its events go only to its stderr. The page on :3000 shows the first gateway's healthy downstream and empty feed. Within one process, publication, SSE delivery and rendering all work, in both `config/firewall.yaml` and Docker sandbox mode. Fixes: `/health` and the page now name the gateway pid and start time, gateway and monitor status are shown separately, a gateway that loses the port says its events won't appear there, and `npm run demo` fails if the monitor it reads belongs to another process.
 
 # 8. Configuration and deployment model
 
