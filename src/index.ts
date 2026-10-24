@@ -11,11 +11,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { loadConfig, toUpstreamLaunch } from './config/load.js';
-import { publishEvent } from './observability/events.js';
+import { publishEvent, publishFileChangeEvent } from './observability/events.js';
 import { startMonitor, type MonitorHandle } from './observability/monitor.js';
 import { createInterceptor } from './proxy/interceptor.js';
 import { startProxyServer, type ProxyServerHandle } from './proxy/server.js';
-import { createStagingArea, sweepStaleStagingDirs, type StagingArea } from './proxy/staging.js';
+import { initStaging, type StagingDeps } from './proxy/staged-call.js';
+import { createStagingArea, StagingLock, sweepStaleStagingDirs, type StagingArea, type SyncResult } from './proxy/staging.js';
 import { connectUpstream, type UpstreamConnection } from './proxy/upstream.js';
 import { evaluateToolCall } from './security/evaluator.js';
 
@@ -45,6 +46,7 @@ async function main(): Promise<void> {
   // Sandbox mode: the container only ever gets a staging copy of the project at /workspace,
   // synced before it starts. Without server.sandbox this is the original local launch.
   let staging: StagingArea | undefined;
+  let initial: SyncResult | undefined;
   let upstream: UpstreamConnection | undefined;
   // Any startup failure (sync, launch mapping, preflight, launch, proxy) stops what already
   // started and removes the staging copy, then rethrows the original error.
@@ -54,8 +56,9 @@ async function main(): Promise<void> {
       // Dirs of firewalls that died before dispose(). Never throws.
       await sweepStaleStagingDirs();
       // The loader guarantees policy.staging exists in sandbox mode.
-      staging = await createStagingArea({ projectRoot: sandbox.project, maxFileBytes: config.policy.staging!.maxFileBytes });
-      await staging.sync();
+      const { maxFileBytes, maxChangesPerCall } = config.policy.staging!;
+      staging = await createStagingArea({ projectRoot: sandbox.project, maxFileBytes, maxChangesPerCall });
+      initial = await staging.sync();
     }
     const connected = await connectUpstream(config.server, {
       launch: toUpstreamLaunch(config.server, staging?.stagingRoot),
@@ -65,12 +68,26 @@ async function main(): Promise<void> {
     });
     upstream = connected;
     monitor?.setProtectedServers(() => (connected.connected ? 1 : 0));
+    // Every allowed call is diffed against staging; only approved changes reach the project.
+    // initStaging reverts anything the server wrote while starting, and until it has run
+    // every allowed call is refused, so a throw here stops startup.
+    let stagingDeps: StagingDeps | undefined;
+    if (staging && initial) {
+      stagingDeps = {
+        area: staging,
+        lock: new StagingLock(),
+        policy: config.policy,
+        onFileChangeEvent: publishFileChangeEvent,
+      };
+      await initStaging(stagingDeps, { serverId: config.server.id, initial });
+    }
     const handleToolCall = createInterceptor({
       serverId: config.server.id,
       policy: config.policy,
       evaluate: evaluateToolCall,
       publish: publishEvent,
       forward: (toolName, args, options) => connected.callTool(toolName, args, options),
+      ...(stagingDeps ? { staging: stagingDeps } : {}),
     });
 
     let proxy: ProxyServerHandle | undefined;
