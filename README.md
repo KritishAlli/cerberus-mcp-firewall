@@ -4,7 +4,7 @@
 
 Cal Hacks 13.0 · Aarav, Winston, Kritish · Full design: [`docs/design.md`](docs/design.md)
 
-**Status: scaffold.** The shared contract, config loader and project tooling are in place. The proxy, policy engine, monitor and demo are stubs. The evaluator stub **denies everything** by design.
+**Status: working prototype.** The repository includes MCP proxy enforcement, policy evaluation, Docker sandbox launch, staged filesystem writes, and a local event monitor. See [`PROJECT_STATUS.md`](PROJECT_STATUS.md) for the current implementation and [`docs/cerberus.md`](docs/cerberus.md) for practical setup instructions, monitor troubleshooting, and the Cerberus product build prompt. Some product integration work (including client-side blocked-action dialogs) remains future work.
 
 ## Quick start
 
@@ -64,9 +64,9 @@ Edit only the files you own. Changes to **shared** files need a quick agreement 
 - **Canonical tool names** are always built with `toCanonicalToolName(serverId, toolName)`, giving `"demo/read_project_file"`.
 - **Cross-team signatures:** `EvaluateToolCall` (Winston → Aarav) and `PublishEvent` (Kritish → Aarav).
 
-## Configure Claude Code
+## Configure an agent client
 
-TODO(Kritish): verified steps for pointing Claude Code at the firewall instead of the downstream server, e.g. an MCP server entry whose command is `npx tsx /abs/path/to/mcp-firewall/src/index.ts`.
+Follow the verified Codex setup and sandbox instructions in [`docs/cerberus.md`](docs/cerberus.md). Client configuration is specific to each agent; only MCP calls routed through this proxy are protected.
 
 ## What is protected, and what is not
 
