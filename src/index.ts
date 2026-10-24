@@ -56,8 +56,17 @@ async function main(): Promise<void> {
       // Dirs of firewalls that died before dispose(). Never throws.
       await sweepStaleStagingDirs();
       // The loader guarantees policy.staging exists in sandbox mode.
-      const { maxFileBytes, maxChangesPerCall } = config.policy.staging!;
-      staging = await createStagingArea({ projectRoot: sandbox.project, maxFileBytes, maxChangesPerCall });
+      const { maxFileBytes, maxChangesPerCall, writablePaths, protectedWritePaths } = config.policy.staging!;
+      staging = await createStagingArea({
+        projectRoot: sandbox.project,
+        maxFileBytes,
+        maxChangesPerCall,
+        preserveStagingDirectories: {
+          writablePaths,
+          protectedPaths: config.policy.protectedPaths,
+          protectedWritePaths,
+        },
+      });
       initial = await staging.sync();
     }
     const connected = await connectUpstream(config.server, {

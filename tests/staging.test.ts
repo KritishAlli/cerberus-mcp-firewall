@@ -16,7 +16,8 @@ import {
   sweepStaleStagingDirs,
   type StagingArea,
 } from '../src/proxy/staging.js';
-import type { ChangeDecision, FileChange } from '../src/shared/contracts.js';
+import type { ChangeDecision, FileChange, FirewallPolicy } from '../src/shared/contracts.js';
+import { evaluateFileChanges } from '../src/security/changes.js';
 
 let tmp: string;
 let area: StagingArea;
@@ -70,6 +71,66 @@ describe('staging / path safety', () => {
 });
 
 describe('staging / sync', () => {
+  it('keeps allowed empty dirs in staging only until an approved file write materializes them', async () => {
+    await mkdir(join(area.projectRoot, 'src'));
+    area = await createStagingArea({
+      projectRoot: area.projectRoot,
+      stagingParent: join(tmp, 'parent'),
+      maxFileBytes: 64,
+      preserveStagingDirectories: {
+        writablePaths: ['src/**'],
+        protectedPaths: ['**/.env'],
+        protectedWritePaths: ['src/locked/**'],
+      },
+    });
+    const policy: FirewallPolicy = {
+      defaultDecision: 'DENY',
+      protectedPaths: ['**/.env'],
+      deniedDestinations: [],
+      allowedRoots: ['.'],
+      allowedHosts: [],
+      approvedTools: [],
+      deniedTools: [],
+      pathArgs: ['path'],
+      destinationArgs: {},
+      destructiveTools: [],
+      writeTools: [],
+      staging: {
+        writablePaths: ['src/**'],
+        protectedWritePaths: ['src/locked/**'],
+        maxFileBytes: 64,
+        maxChangesPerCall: 10,
+      },
+    };
+
+    const first = await area.sync();
+    await mkdir(join(area.stagingRoot, 'src/newdir'), { recursive: true });
+    await mkdir(join(area.stagingRoot, 'docs/newdir'), { recursive: true });
+    await mkdir(join(area.stagingRoot, 'src/locked/newdir'), { recursive: true });
+    await mkdir(join(area.stagingRoot, '.git/newdir'), { recursive: true });
+
+    // Directories aren't project changes and are deliberately not applied.
+    expect(await area.diff(first.staging)).toEqual([]);
+    const afterCreate = await area.baselineAfter(first, [], new Map());
+    expect(await area.diff(afterCreate.staging)).toEqual([]);
+    const next = await area.sync();
+
+    expect((await lstat(join(area.stagingRoot, 'src/newdir'))).isDirectory()).toBe(true);
+    await expect(lstat(join(area.stagingRoot, 'docs/newdir'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(lstat(join(area.stagingRoot, 'src/locked/newdir'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(lstat(join(area.stagingRoot, '.git/newdir'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(lstat(join(area.projectRoot, 'src/newdir'))).rejects.toMatchObject({ code: 'ENOENT' });
+
+    await put(area.stagingRoot, 'src/newdir/example.ts', 'export const answer = 42;\n');
+    const changes = await area.diff(next.staging);
+    const decisions = evaluateFileChanges(changes, policy);
+    expect(decisions).toMatchObject([{ path: 'src/newdir/example.ts', decision: 'ALLOW' }]);
+    expect(await area.apply(changes, decisions, next.project)).toMatchObject([
+      { path: 'src/newdir/example.ts', applied: true },
+    ]);
+    expect(await readFile(join(area.projectRoot, 'src/newdir/example.ts'), 'utf8')).toContain('answer = 42');
+  });
+
   it('never copies excluded files, reports server writes to them in diff and removes them on the next sync', async () => {
     const p = area.projectRoot;
     await put(p, '.git/HEAD', 'ref: refs/heads/main');

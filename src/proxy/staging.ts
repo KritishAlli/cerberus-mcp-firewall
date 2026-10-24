@@ -40,6 +40,7 @@ import {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { ChangeDecision, FileChange, RuleId } from '../shared/contracts.js';
+import { pathMatches } from '../security/normalize.js';
 
 /** Never copied into staging, never reported by diff, never applied. */
 export const DEFAULT_EXCLUDES: readonly string[] = ['.git/', 'node_modules/', '.env', '.env.*'];
@@ -117,6 +118,16 @@ export interface StagingOptions {
   excludes?: readonly string[];
   /** Added to the excludes, e.g. the policy's protected secret files. */
   extraExcludes?: readonly string[];
+  /**
+   * Empty directories in these writable paths may remain in the disposable
+   * staging tree between calls. They are never applied to the project by
+   * themselves; an approved file write may create their parents in the project.
+   */
+  preserveStagingDirectories?: {
+    writablePaths: readonly string[];
+    protectedPaths?: readonly string[];
+    protectedWritePaths?: readonly string[];
+  };
   /** FileChange.text is filled only for files of at most this many bytes; larger files are never applied. */
   maxFileBytes: number;
   /**
@@ -216,6 +227,11 @@ function isExcludedPath(rules: ExcludeRule[], rel: string): boolean {
     }
   }
   return false;
+}
+
+/** Match a directory itself or a path immediately below it against a policy glob. */
+function matchesDirectoryOrDescendant(dir: string, pattern: string): boolean {
+  return pathMatches(dir, pattern) || pathMatches(`${dir}/__mcp_firewall_directory_probe__`, pattern);
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +614,7 @@ export async function createStagingArea(options: StagingOptions): Promise<Stagin
     projectRoot,
     stagingRoot,
     compileExcludes(excludes),
+    options.preserveStagingDirectories,
     options.maxFileBytes,
     options.maxChangesPerCall ?? 1000,
     options.log ?? ((line: string) => process.stderr.write(`${line}\n`)),
@@ -617,6 +634,7 @@ export class StagingArea {
     readonly projectRoot: string,
     readonly stagingRoot: string,
     private readonly rules: ExcludeRule[],
+    private readonly preserveStagingDirectories: StagingOptions['preserveStagingDirectories'],
     private readonly maxFileBytes: number,
     private readonly maxChangesPerCall: number,
     private readonly log: (line: string) => void,
@@ -986,16 +1004,27 @@ export class StagingArea {
       const abs = path.join(dirAbs, name);
       const st = await lstat(abs);
       const want = project.get(rel);
+      const keepStagingOnlyDir =
+        want === undefined && st.isDirectory() && this.shouldPreserveStagingDirectory(rel);
       const keep =
         want !== undefined &&
         (want.type === 'dir'
           ? st.isDirectory()
           : want.type === 'symlink'
             ? st.isSymbolicLink()
-            : want.sha256 !== undefined && st.isFile());
+            : want.sha256 !== undefined && st.isFile()) || keepStagingOnlyDir;
       if (!keep) await rm(abs, { recursive: true, force: true });
       else if (st.isDirectory()) await this.pruneStaging(rel, project);
     }
+  }
+
+  private shouldPreserveStagingDirectory(rel: string): boolean {
+    const policy = this.preserveStagingDirectories;
+    if (!policy || isExcludedPath(this.rules, rel)) return false;
+    if (!policy.writablePaths.some((pattern) => matchesDirectoryOrDescendant(rel, pattern))) return false;
+    if (policy.protectedPaths?.some((pattern) => matchesDirectoryOrDescendant(rel, pattern))) return false;
+    if (policy.protectedWritePaths?.some((pattern) => matchesDirectoryOrDescendant(rel, pattern))) return false;
+    return true;
   }
 
   /** Copies one project entry into staging. Symlinks are recreated, never followed; devices etc. are skipped. */

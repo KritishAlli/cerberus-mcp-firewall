@@ -94,6 +94,8 @@ Then ask the agent to use only `mcp_firewall`:
 
 The request ID at the end of a BLOCKED message is the correlation key. If you can't find it on the monitor, the monitor belongs to a different gateway.
 
+**New directories:** An empty directory created under `policy.staging.writablePaths` stays in the disposable staging copy between calls; `create_directory` alone does not add it to the real project. If a later approved file write lands inside it, that file and its parent directories are applied. Directories outside writable paths or under protected/excluded paths are removed from staging at the next sync.
+
 Claude Code may refuse a risky call itself before sending it, in which case it never reaches Cerberus. That is not a Cerberus result. `npm run demo` always sends the call.
 
 ## Troubleshooting
