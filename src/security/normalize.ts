@@ -44,10 +44,18 @@ export function pathMatches(pathValue: string, configuredPattern: string): boole
 export interface DestinationMatch { malformed: boolean; hostname?: string; origin?: string }
 
 /** Parse and canonicalize an outbound URL. Non-URL bare host values are accepted. */
-export function normalizeDestination(value: string): DestinationMatch {
+export function normalizeDestination(value: string, allowBareHost = false): DestinationMatch {
   try {
-    const url = new URL(value);
+    const input = value.trim();
+    let url: URL;
+    try {
+      url = new URL(input);
+    } catch {
+      if (!allowBareHost || !/^[A-Za-z0-9.-]+(?::\d+)?$/.test(input)) return { malformed: true };
+      url = new URL(`https://${input}`);
+    }
     if (!['http:', 'https:'].includes(url.protocol)) return { malformed: true };
+    if (!url.hostname || url.username || url.password) return { malformed: true };
     return { malformed: false, hostname: url.hostname.toLowerCase().replace(/\.$/, ''), origin: url.origin.toLowerCase() };
   } catch {
     return { malformed: true };
@@ -62,6 +70,90 @@ export function destinationMatches(destination: DestinationMatch, configured: st
   if (!hostPart) return false;
   if (hostPart.startsWith('*.')) return destination.hostname === hostPart.slice(2) || destination.hostname.endsWith(`.${hostPart.slice(2)}`);
   return destination.hostname === hostPart || destination.hostname.endsWith(`.${hostPart}`);
+}
+
+/** A URL/host is allowed only by an exact host entry or an explicit `*.domain` entry. */
+export function destinationAllowed(destination: DestinationMatch, allowedHosts: readonly string[]): boolean {
+  const destinationHost = destination.hostname;
+  if (destination.malformed || !destinationHost) return false;
+  return allowedHosts.some((entry) => {
+    const raw = entry.trim().toLowerCase();
+    const wildcard = raw.startsWith('*.');
+    const configured = wildcard ? raw.slice(2) : raw;
+    const normalized = normalizeDestination(configured, true);
+    if (normalized.malformed || !normalized.hostname) return false;
+    return wildcard
+      ? destinationHost === normalized.hostname || destinationHost.endsWith(`.${normalized.hostname}`)
+      : destinationHost === normalized.hostname;
+  });
+}
+
+/** True only when a normalized path is equal to an allowed root or a descendant of it. */
+export function pathWithinRoots(value: string, roots: readonly string[]): boolean {
+  const candidate = normalizePath(decodePath(value));
+  if (candidate === '' || candidate === '.' || candidate === '..' || candidate.startsWith('../')) return false;
+  return roots.some((rootValue) => {
+    const normalizedRoot = normalizePath(decodePath(rootValue));
+    const root = normalizedRoot === '/' ? '/' : normalizedRoot.replace(/\/$/, '');
+    if (root === '/') return candidate.startsWith('/');
+    if (root === '.') return !candidate.startsWith('/') && !/^[a-z]:\//i.test(candidate);
+    if (!root) return false;
+    const insensitive = process.platform === 'win32' || /^[a-z]:\//i.test(root) || /^[a-z]:\//i.test(candidate);
+    const left = insensitive ? candidate.toLowerCase() : candidate;
+    const right = insensitive ? root.toLowerCase() : root;
+    return left === right || left.startsWith(`${right}/`);
+  });
+}
+
+function decodePath(value: string): string {
+  try { return decodeURIComponent(value); } catch { return value; }
+}
+
+export interface StringReference { value: string; start: number; end: number }
+
+/** Find explicit URLs in arbitrary argument strings, including once-percent-encoded URLs. */
+export function extractUrlReferences(value: string): StringReference[] {
+  const references: StringReference[] = [];
+  const seen = new Set<string>();
+  const scan = (source: string) => {
+    const re = /\b(?:https?|ftp|file):\/\/[^\s"'`<>]+/gi;
+    for (const match of source.matchAll(re)) {
+      const start = match.index ?? 0;
+      const raw = match[0].replace(/[.,;:!?\])}]+$/g, '');
+      const key = `${start}:${raw}`;
+      if (raw && !seen.has(key)) { seen.add(key); references.push({ value: raw, start, end: start + raw.length }); }
+    }
+  };
+  scan(value);
+  let decoded: string;
+  try { decoded = decodeURIComponent(value); } catch { decoded = value; }
+  if (decoded !== value) scan(decoded);
+  return references;
+}
+
+/** Extract path-looking tokens from free-form strings; named path fields are handled separately. */
+export function extractPathReferences(value: string): string[] {
+  const withoutUrls = value.replace(/\b(?:https?|ftp|file):\/\/[^\s"'`<>]+/gi, ' ');
+  let decoded = withoutUrls;
+  try { decoded = decodeURIComponent(withoutUrls); } catch { /* Keep original text when it is not URL-encoded. */ }
+  const paths = new Set<string>();
+  const patterns = [
+    /~[\\/][^\s"'`<>;,|&]+/g,
+    /(?:^|[\s=:'"(])(?:\.{1,2}[\\/])[^\s"'`<>;,|&]+/g,
+    /[A-Za-z]:[\\/][^\s"'`<>;,|&]+/g,
+    /(?:^|[\s=:'"(])\/(?:[^\s"'`<>;,|&]+\/)*[^\s"'`<>;,|&]*/g,
+    /(?:[\w.@+-]+[\\/])+[\w.@+-]+/g,
+    /(?:^|[\s=:'"(])(?:\.[\w.-]+|[\w.-]+\.(?:env|json|ya?ml|toml|md|txt|ts|tsx|js|jsx|py|sh|pem|key|lock|cfg|conf|ini))(?:$|[\s"'`,;:!?)}])/g,
+  ];
+  for (const source of [withoutUrls, decoded]) {
+    for (const pattern of patterns) {
+      for (const match of source.matchAll(pattern)) {
+        const raw = match[0].trim().replace(/^[\s=:'"(]+|[\s"'`,;:!?)}]+$/g, '');
+        if (raw) paths.add(raw);
+      }
+    }
+  }
+  return [...paths];
 }
 
 export function isPlainRecord(value: unknown): value is Record<string, unknown> {

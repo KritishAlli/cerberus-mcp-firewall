@@ -67,6 +67,9 @@ export const RULE_IDS = [
    * throws or the policy is unusable, so the call still fails closed (§5, §6.4).
    */
   'EVALUATION_ERROR',
+  'PATH_NOT_ALLOWED',
+  'HOST_NOT_ALLOWED',
+  'SESSION_TAINTED',
 
   // --- Staged writes (EvaluateFileChanges) ---------------------------------
 
@@ -91,6 +94,9 @@ export type RuleId = z.infer<typeof RuleIdSchema>;
 // ToolCallContext — built by the proxy, consumed by the evaluator
 // ---------------------------------------------------------------------------
 
+export const SessionContextSchema = z.strictObject({ tainted: z.boolean() });
+export type SessionContext = z.infer<typeof SessionContextSchema>;
+
 export const ToolCallContextSchema = z.strictObject({
   /** Generated correlation ID. */
   requestId: identifier,
@@ -99,6 +105,8 @@ export const ToolCallContextSchema = z.strictObject({
   /** Exact exposed tool name (not canonical; see toCanonicalToolName). */
   toolName: identifier,
   arguments: z.record(z.string(), z.unknown()),
+  /** Taint state supplied by the session manager. */
+  session: SessionContextSchema.default({ tainted: false }),
 });
 export type ToolCallContext = z.infer<typeof ToolCallContextSchema>;
 
@@ -160,6 +168,10 @@ export const FirewallPolicySchema = z.strictObject({
   protectedPaths: z.array(z.string().min(1)).default([]),
   /** Hostnames / origins that must never receive data. */
   deniedDestinations: z.array(z.string().min(1)).default([]),
+  /** Filesystem roots a path-like argument may address. Empty means no path is allowed. */
+  allowedRoots: z.array(z.string().min(1)).default([]),
+  /** Hostnames a URL-like argument may address. Empty means no URL is allowed. */
+  allowedHosts: z.array(z.string().min(1)).default([]),
   /** Canonical "serverId/toolName" entries. */
   approvedTools: z.array(z.string().min(1)).default([]),
   /** Canonical "serverId/toolName" entries. */
@@ -177,6 +189,8 @@ export const FirewallPolicySchema = z.strictObject({
   destinationArgs: z.record(z.string().min(1), z.array(z.string().min(1))).default({}),
   /** Canonical tool names treated as destructive (DESTRUCTIVE_ACTION). */
   destructiveTools: z.array(z.string().min(1)).default([]),
+  /** Canonical tools that mutate files; used for secret scanning and tainted-session gating. */
+  writeTools: z.array(z.string().min(1)).default([]),
 
   // --- Staged writes --------------------------------------------------------
 

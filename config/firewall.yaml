@@ -28,6 +28,11 @@ policy:
   deniedDestinations:
     - example-attacker.invalid
 
+  # Relative demo paths are rooted at the configured mock project.
+  allowedRoots: ["."]
+  # No outbound host is approved in the demo.
+  allowedHosts: []
+
   approvedTools:
     - demo/read_project_file
 
@@ -43,3 +48,4 @@ policy:
 
   # Canonical tool names treated as destructive (DESTRUCTIVE_ACTION).
   destructiveTools: []
+  writeTools: []

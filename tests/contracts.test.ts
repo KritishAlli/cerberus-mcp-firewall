@@ -344,7 +344,7 @@ describe('evaluator contract', () => {
 
   it('returns a schema-valid decision', () => {
     const decision = evaluateToolCall(
-      { requestId: 'r1', serverId: 'demo', toolName: 'unknown_tool', arguments: {} },
+      { requestId: 'r1', serverId: 'demo', toolName: 'unknown_tool', arguments: {}, session: { tainted: false } },
       policy,
     );
     expect(PolicyDecisionSchema.safeParse(decision).success).toBe(true);
@@ -352,7 +352,7 @@ describe('evaluator contract', () => {
 
   it('denies an unknown, unapproved tool', () => {
     const decision = evaluateToolCall(
-      { requestId: 'r2', serverId: 'demo', toolName: 'totally_unknown_tool', arguments: {} },
+      { requestId: 'r2', serverId: 'demo', toolName: 'totally_unknown_tool', arguments: {}, session: { tainted: false } },
       policy,
     );
     expect(decision.decision).toBe('DENY');

@@ -33,6 +33,11 @@ policy:
   protectedPaths:
     - "**/.env"
 
+  # Filesystem-server paths may be relative to /workspace or absolute there.
+  allowedRoots: [".", "/workspace"]
+  # Docker has no network in sandbox mode, so no outbound host is allowed.
+  allowedHosts: []
+
   # Every tool of @modelcontextprotocol/server-filesystem 2026.8.31. Writes are
   # allowed through to the sandbox; what lands in the project is decided by `staging`.
   approvedTools:
@@ -52,6 +57,11 @@ policy:
     - fs/list_allowed_directories
 
   pathArgs: [path, paths, source, destination]
+  writeTools:
+    - fs/write_file
+    - fs/edit_file
+    - fs/create_directory
+    - fs/move_file
 
   staging:
     writablePaths:

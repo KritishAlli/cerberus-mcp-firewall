@@ -55,11 +55,14 @@ const policy: FirewallPolicy = {
   defaultDecision: 'DENY',
   protectedPaths: [],
   deniedDestinations: [],
+  allowedRoots: ['.'],
+  allowedHosts: [],
   approvedTools: [],
   deniedTools: [],
   pathArgs: ['path'],
   destinationArgs: {},
   destructiveTools: [],
+  writeTools: [],
 };
 
 // ---------------------------------------------------------------------------
@@ -139,6 +142,12 @@ describe('proxy / interceptor (unit)', () => {
       timestamp: '2026-10-24T02:00:00.000Z',
     });
     expect(FirewallEventSchema.safeParse(h.events[0]).success).toBe(true);
+  });
+
+  it('passes the current session taint state into the evaluator context', async () => {
+    const h = harness({ getSession: () => ({ tainted: true }) });
+    await h.handler('write_file', { path: 'src/index.ts' });
+    expect(h.evaluated[0]?.session).toEqual({ tainted: true });
   });
 
   it('T02: DENY → forward called zero times, recognizable MCP tool error returned', async () => {

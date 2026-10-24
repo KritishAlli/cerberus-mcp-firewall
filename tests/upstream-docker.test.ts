@@ -276,11 +276,14 @@ describe.skipIf(dockerSkipReason !== undefined)('upstream / docker integration',
     defaultDecision: 'DENY',
     protectedPaths: [],
     deniedDestinations: [],
+    allowedRoots: ['.'],
+    allowedHosts: [],
     approvedTools: [],
     deniedTools: [],
     pathArgs: [],
     destinationArgs: {},
     destructiveTools: [],
+    writeTools: [],
   };
   let dir: string;
   let upstream: UpstreamConnection;
