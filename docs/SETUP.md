@@ -88,9 +88,11 @@ Then ask the agent to use only `mcp_firewall`:
 | # | Ask the agent to… | Expected result (sandbox config) |
 | --- | --- | --- |
 | 1 | list `/workspace` | Succeeds (`README.md`, `package.json`, `src`). Monitor: `ALLOW APPROVED_TOOL`. |
-| 2 | read `/workspace/.env` with `read_text_file`, without trying another path | `[MCP Firewall] BLOCKED (PROTECTED_PATH) … [request <id>]`. Monitor: `DENY PROTECTED_PATH` with the **same request ID**. |
-| 3 | list a host path outside the project, e.g. this repo's `demo` folder | `BLOCKED (PATH_NOT_ALLOWED)`. |
-| 4 | (optional) write `/workspace/package.json` | The tool runs on the staging copy, then `changes blocked … package.json (WRITE_NOT_ALLOWED)`. The real file is unchanged. Monitor: `ALLOW · WRITES BLOCKED`. |
+| 2 | read `/workspace/.env` with `read_text_file`, without trying another path; answer `n` at the terminal prompt | Terminal: `[Cerberus] DENY … (PROTECTED_PATH)` and an `Override …? [y/N]` prompt. The tool result is `[MCP Firewall] BLOCKED (PROTECTED_PATH) …`. Monitor: `DENY PROTECTED_PATH` with the **same request ID**. |
+| 3 | list a host path outside the project, e.g. this repo's `demo` folder; answer `n` | Terminal asks whether to override `PATH_NOT_ALLOWED`; the tool result remains `BLOCKED (PATH_NOT_ALLOWED)`. |
+| 4 | (optional) write `/workspace/package.json`; answer `n` at the sandbox prompt | The tool runs on the staging copy, then reports `changes blocked … package.json (WRITE_NOT_ALLOWED)`. The real file is unchanged. Monitor: `ALLOW · WRITES BLOCKED`. |
+
+For an intentional one-request override, type `y` at the matching prompt. Cerberus forwards that specific policy-denied call or applies the safely applicable rejected file changes, and records `USER_APPROVED_OVERRIDE`; the policy itself is unchanged. Invalid requests, evaluator failures, and staged changes the safe apply layer cannot honor remain blocked. Sandbox overrides are offered only when 12 or fewer rejected changes can be listed for review. The prompt uses the gateway process's controlling terminal. If no terminal is available, the DENY is logged and remains blocked automatically. Do not type `y` unless you have reviewed the tool/reason or rejected paths shown in the prompt.
 
 The request ID at the end of a BLOCKED message is the correlation key. If you can't find it on the monitor, the monitor belongs to a different gateway.
 

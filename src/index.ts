@@ -18,6 +18,7 @@ import { startProxyServer, type ProxyServerHandle } from './proxy/server.js';
 import { initStaging, type StagingDeps } from './proxy/staged-call.js';
 import { createStagingArea, StagingLock, sweepStaleStagingDirs, type StagingArea, type SyncResult } from './proxy/staging.js';
 import { connectUpstream, type UpstreamConnection } from './proxy/upstream.js';
+import { createTerminalApproval } from './proxy/terminal-approval.js';
 import { evaluateToolCall } from './security/evaluator.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -47,6 +48,7 @@ async function main(): Promise<void> {
   // synced before it starts. Without server.sandbox this is the original local launch.
   let staging: StagingArea | undefined;
   let initial: SyncResult | undefined;
+  const terminalApproval = createTerminalApproval();
   let upstream: UpstreamConnection | undefined;
   // Any startup failure (sync, launch mapping, preflight, launch, proxy) stops what already
   // started and removes the staging copy, then rethrows the original error.
@@ -86,6 +88,7 @@ async function main(): Promise<void> {
         area: staging,
         lock: new StagingLock(),
         policy: config.policy,
+        terminalApproval: terminalApproval.changes,
         onFileChangeEvent: publishFileChangeEvent,
       };
       await initStaging(stagingDeps, { serverId: config.server.id, initial });
@@ -95,6 +98,7 @@ async function main(): Promise<void> {
       policy: config.policy,
       evaluate: evaluateToolCall,
       publish: publishEvent,
+      terminalApproval,
       forward: (toolName, args, options) => connected.callTool(toolName, args, options),
       ...(stagingDeps ? { staging: stagingDeps } : {}),
     });

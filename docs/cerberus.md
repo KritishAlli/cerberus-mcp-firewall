@@ -74,7 +74,7 @@ Each person owns one workstream. Work in parallel only behind the shared interfa
 **Tasks:**
 
 1. Audit current policy and staged-write decisions against Cerberus use cases. Keep default-deny behavior for unclassified sensitive actions.
-2. Define exactly what a user can do from a blocked-action dialog. Default action is **Block**. If implementing “Allow once,” scope it to one request, make it expire, record the approval, and prevent it from changing persistent policy. Do not implement broad “trust” shortcuts in this phase.
+2. Implement one-request terminal approvals for policy DENYs and safely applicable staged changes. Use the controlling terminal rather than MCP stdin/stdout, record explicit overrides, and keep invalid requests, evaluator failures, and unsafe staged changes blocked. Native client dialogs and broad “trust” shortcuts remain future work.
 3. Ensure paths, URLs, tool arguments, and displayed reasons are normalized/validated safely; secrets and full file contents must never appear in dialog payloads or events.
 4. Threat-model UI spoofing, stale approvals, request correlation, concurrent calls, malformed adapter responses, and monitor disconnects. Record decisions in `docs/DECISIONS.md`.
 5. Add tests for policy outcomes, approval scope/expiry if present, event redaction, and fail-closed handling.

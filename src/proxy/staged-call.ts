@@ -39,6 +39,7 @@ import {
   type RuleId,
 } from '../shared/contracts.js';
 import { evaluateFileChanges } from '../security/changes.js';
+import type { TerminalApproval } from './terminal-approval.js';
 import {
   StagingApplyError,
   type ApplyResult,
@@ -82,6 +83,8 @@ export interface StagingDeps {
   policy: FirewallPolicy;
   /** Must not throw; if it does, the error is logged and the result is unaffected. */
   onFileChangeEvent?: (event: FileChangeEvent) => void;
+  /** One-time approval for safely applicable sandbox changes; technical hard-denials remain enforced. */
+  terminalApproval?: TerminalApproval['changes'];
 }
 
 export interface StagedChange {
@@ -277,10 +280,31 @@ async function settleChanges(
   let restored: Manifest = new Map();
   if (changes.length > 0) {
     // Excluded paths and unsafe names are DENY whatever the evaluator says.
-    const decisions = decide(staging, changes, ctx).map((d): ChangeDecision => {
+    let decisions = decide(staging, changes, ctx).map((d): ChangeDecision => {
       const forced = d.decision === 'ALLOW' ? staging.area.forcedDenyReason(d.path) : undefined;
       return forced ? { ...d, decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED', reason: forced } : d;
     });
+    const eligible = changes.filter((change, index) => {
+      const decision = decisions[index]!;
+      return decision.decision === 'DENY'
+        && !['EVALUATION_ERROR', 'CHANGE_LIMIT', 'WRITE_CONFLICT', 'SYMLINK_DENIED'].includes(decision.ruleId)
+        && change.kind !== 'symlink'
+        && change.kind !== 'special'
+        && !staging.area.forcedDenyReason(change.path);
+    });
+    if (eligible.length > 0 && staging.terminalApproval
+      && await staging.terminalApproval(ctx.requestId, ctx.toolName, eligible,
+        eligible.map((change) => decisions.find((decision) => decision.path === change.path)!))) {
+      const approved = new Set(eligible.map((change) => change.path));
+      decisions = decisions.map((decision) => approved.has(decision.path)
+        ? {
+            ...decision,
+            decision: 'ALLOW',
+            ruleId: 'USER_APPROVED_OVERRIDE',
+            reason: `User approved one-time override of ${decision.ruleId}: ${decision.reason}`.slice(0, 200),
+          }
+        : decision);
+    }
     results = await staging.area.apply(changes, decisions, projectAtSync);
     const rejected = results.filter((r) => !r.applied).map((r) => r.path);
     if (rejected.length > 0) restored = await staging.area.revert(rejected);
