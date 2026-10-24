@@ -68,7 +68,7 @@ describe('staging / path safety', () => {
 });
 
 describe('staging / sync', () => {
-  it('never copies excluded files, ignores them in diff and removes them on the next sync', async () => {
+  it('never copies excluded files, reports server writes to them in diff and removes them on the next sync', async () => {
     const p = area.projectRoot;
     await put(p, '.git/HEAD', 'ref: refs/heads/main');
     await put(p, 'node_modules/pkg/index.js', 'x');
@@ -85,7 +85,11 @@ describe('staging / sync', () => {
     await put(area.stagingRoot, '.env', 'planted');
     await put(area.stagingRoot, 'node_modules/evil.js', 'planted');
     await put(area.stagingRoot, 'sub/x.pem', 'planted');
-    expect(await area.diff(staging)).toEqual([]);
+    expect(await area.diff(staging)).toEqual([
+      { path: '.env', kind: 'add', size: 7, executable: false, text: 'planted' },
+      { path: 'node_modules/evil.js', kind: 'add', size: 7, executable: false, text: 'planted' },
+      { path: 'sub/x.pem', kind: 'add', size: 7, executable: false, text: 'planted' },
+    ]);
 
     await area.sync();
     expect(await staged()).toEqual(['keys', 'src', 'src/app.ts', 'sub']);

@@ -87,6 +87,46 @@ server.registerTool(
   },
 );
 
+server.registerTool(
+  'flood_node_modules',
+  { description: 'Writes count files under node_modules/flood/.', inputSchema: z.object({ count: z.number() }) },
+  async ({ count }) => {
+    received('flood_node_modules');
+    await mkdir(join(root, 'node_modules/flood'), { recursive: true });
+    for (let i = 0; i < count; i++) await writeFile(join(root, `node_modules/flood/f${i}.js`), 'module.exports = 1;\n');
+    return text(`flooded ${count}`);
+  },
+);
+
+server.registerTool('write_unsafe_names', { description: 'Writes files whose names contain a backslash or ESC.' }, async () => {
+  received('write_unsafe_names');
+  await mkdir(join(root, '.git'), { recursive: true });
+  await writeFile(join(root, '.git', 'evil\\name'), 'x');
+  await writeFile(join(root, 'src', 'bad\u001bname'), 'x');
+  await writeFile(join(root, 'src', 'a\\b.ts'), 'x');
+  return text('wrote unsafe names');
+});
+
+server.registerTool(
+  'write_big_unreadable',
+  {
+    description: 'Writes a file of `bytes` zero bytes, then makes it unreadable (mode 000).',
+    inputSchema: z.object({ path: z.string(), bytes: z.number() }),
+  },
+  async ({ path, bytes }) => {
+    received('write_big_unreadable');
+    await put(path, '');
+    await writeFile(join(root, path), Buffer.alloc(bytes));
+    await chmod(join(root, path), 0o000);
+    return text(`wrote ${bytes} bytes`);
+  },
+);
+
+server.registerTool('noop', { description: 'Writes nothing.' }, async () => {
+  received('noop');
+  return text('nothing written');
+});
+
 server.registerTool('fail_after_write', { description: 'Writes src/partial.ts, then fails.' }, async () => {
   received('fail_after_write');
   await put('src/partial.ts', 'export const partial = true;\n');

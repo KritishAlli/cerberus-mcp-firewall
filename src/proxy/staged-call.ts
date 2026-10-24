@@ -10,9 +10,13 @@
  *   3. forward the call
  *   4. always (result, tool error, timeout): diff against the pre-call snapshot
  *   5. evaluateFileChanges, validated; if it throws or returns anything malformed,
- *      every change is DENY / EVALUATION_ERROR
- *   6. apply approved changes, revert rejected ones, sync again → baseline for the next catch-up
- *   7. _meta['mcp-firewall/staged'], a note listing rejected paths, one FileChangeEvent
+ *      every change is DENY / EVALUATION_ERROR. Excluded paths (.git/, .env, …) and
+ *      unsafe file names are DENY whatever it says.
+ *   6. apply approved changes, revert rejected ones, remove excluded paths from staging,
+ *      and set the baseline for the next catch-up to the expected state (no rescan of
+ *      staging, so a write landing after step 4 is caught next time, not overwritten)
+ *   7. _meta['mcp-firewall/staged'], a note listing rejected paths, and a FileChangeEvent
+ *      if there were any changes
  *
  * Any error from sync/diff/apply/revert breaks staging for good: nothing more is
  * applied and every later allowed call is refused until restart. Allowed calls are
@@ -34,7 +38,14 @@ import {
   type FirewallPolicy,
   type RuleId,
 } from '../shared/contracts.js';
-import { StagingApplyError, type Manifest, type StagingArea, type StagingLock, type SyncResult } from './staging.js';
+import {
+  StagingApplyError,
+  type ApplyResult,
+  type Manifest,
+  type StagingArea,
+  type StagingLock,
+  type SyncResult,
+} from './staging.js';
 import { evaluateFileChangesStub } from './stubs/evaluate-file-changes.stub.js';
 
 /** Key under CallToolResult._meta carrying the staged-writes outcome of the call. */
@@ -51,11 +62,14 @@ const LATE_TOOL_NAME = '<late-writes>';
 const STARTUP_TOOL_NAME = '<startup>';
 const STARTUP_REQUEST_ID = 'startup';
 const STARTUP_REASON = 'change made before any tool call';
-/** Rejected paths listed in the result note; the rest are counted. */
-const MAX_NOTE_PATHS = 20;
+/** Changes listed in _meta and rejected paths listed in the result note; the rest are only counted. */
+export const MAX_REPORTED_CHANGES = 100;
 
 /** What staged-call needs from a StagingArea (an interface, so tests can wrap one). */
-export type StagingAreaLike = Pick<StagingArea, 'sync' | 'diff' | 'apply' | 'revert'>;
+export type StagingAreaLike = Pick<
+  StagingArea,
+  'sync' | 'diff' | 'apply' | 'revert' | 'forcedDenyReason' | 'removeExcluded' | 'baselineAfter'
+>;
 
 export interface StagingDeps {
   area: StagingAreaLike;
@@ -77,9 +91,20 @@ export interface StagedChange {
 
 /** `_meta['mcp-firewall/staged']`. */
 export interface StagedMeta {
+  /** True totals, even when `changes` is truncated. */
   applied: number;
   rejected: number;
+  /** At most MAX_REPORTED_CHANGES entries, in path order. */
   changes: StagedChange[];
+  /** Present (true) only when `changes` was capped. */
+  truncated?: true;
+}
+
+interface Settled {
+  entries: StagedChange[];
+  results: ApplyResult[];
+  /** What revert() put back in staging. */
+  restored: Manifest;
 }
 
 /** Per-call context the interceptor provides. */
@@ -124,19 +149,20 @@ export async function initStaging(
   const log = options.log ?? ((line: string) => process.stderr.write(`${line}\n`));
   try {
     const changes = await staging.area.diff(options.initial.staging);
+    const results = changes.map((c): ApplyResult => ({ path: c.path, applied: false, ruleId: 'WRITE_NOT_ALLOWED' }));
+    const restored = await staging.area.revert(changes.map((c) => c.path));
+    await staging.area.removeExcluded();
     if (changes.length > 0) {
-      await staging.area.revert(changes.map((c) => c.path));
       log(`[firewall] startup: reverted ${changes.length} change(s) made before any tool call (${STARTUP_REASON})`);
-      const entries = changes.map((c): StagedChange => ({ path: c.path, decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' }));
       emitFileChangeEvent(staging, log, {
         now: options.now ?? Date.now,
         serverId: options.serverId,
         requestId: STARTUP_REQUEST_ID,
         toolName: STARTUP_TOOL_NAME,
-        entries,
+        entries: results.map((r) => ({ path: r.path, decision: 'DENY', ruleId: r.ruleId })),
       });
     }
-    state.baseline = await staging.area.sync();
+    state.baseline = await staging.area.baselineAfter(options.initial, results, restored);
   } catch (err) {
     state.broken = true;
     throw err;
@@ -166,8 +192,8 @@ export async function runStagedCall(
     let pre: SyncResult;
     try {
       const late = await staging.area.diff(baseline.staging);
-      if (late.length > 0) {
-        const entries = await settleChanges(staging, late, baseline.project, ctx);
+      const { entries } = await settleChanges(staging, late, baseline.project, ctx);
+      if (entries.length > 0) {
         emitFileChangeEvent(staging, ctx.log, {
           ...ctx,
           requestId: `${ctx.requestId}:late`,
@@ -191,8 +217,10 @@ export async function runStagedCall(
     let entries: StagedChange[];
     try {
       const changes = await staging.area.diff(pre.staging);
-      entries = await settleChanges(staging, changes, pre.project, ctx);
-      state.baseline = await staging.area.sync();
+      const settled = await settleChanges(staging, changes, pre.project, ctx);
+      entries = settled.entries;
+      // Expected state, not a rescan: a write landing from here on shows up in the next catch-up diff.
+      state.baseline = await staging.area.baselineAfter(pre, settled.results, settled.restored);
     } catch (err) {
       return fail(state, ctx, err, true);
     }
@@ -233,19 +261,31 @@ function fail(state: StagingState, ctx: StagedCallContext, err: unknown, forward
   );
 }
 
-/** Evaluate → apply approved → revert rejected. Returns what happened to each change, in order. */
+/**
+ * Evaluate → apply approved → revert rejected → remove excluded paths from staging.
+ * Returns what happened to each change, in order.
+ */
 async function settleChanges(
   staging: StagingDeps,
   changes: FileChange[],
   projectAtSync: Manifest,
   ctx: StagedCallContext,
-): Promise<StagedChange[]> {
-  if (changes.length === 0) return [];
-  const decisions = decide(staging, changes, ctx);
-  const results = await staging.area.apply(changes, decisions, projectAtSync);
-  const rejected = results.filter((r) => !r.applied).map((r) => r.path);
-  if (rejected.length > 0) await staging.area.revert(rejected);
-  return results.map((r) => ({ path: r.path, decision: r.applied ? 'ALLOW' : 'DENY', ruleId: r.ruleId }));
+): Promise<Settled> {
+  let results: ApplyResult[] = [];
+  let restored: Manifest = new Map();
+  if (changes.length > 0) {
+    // Excluded paths and unsafe names are DENY whatever the evaluator says.
+    const decisions = decide(staging, changes, ctx).map((d): ChangeDecision => {
+      const forced = d.decision === 'ALLOW' ? staging.area.forcedDenyReason(d.path) : undefined;
+      return forced ? { ...d, decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED', reason: forced } : d;
+    });
+    results = await staging.area.apply(changes, decisions, projectAtSync);
+    const rejected = results.filter((r) => !r.applied).map((r) => r.path);
+    if (rejected.length > 0) restored = await staging.area.revert(rejected);
+  }
+  await staging.area.removeExcluded();
+  const entries = results.map((r): StagedChange => ({ path: r.path, decision: r.applied ? 'ALLOW' : 'DENY', ruleId: r.ruleId }));
+  return { entries, results, restored };
 }
 
 /** evaluateFileChanges on a frozen copy, validated. Anything unexpected → every change DENY. */
@@ -281,15 +321,20 @@ function decide(staging: StagingDeps, changes: FileChange[], ctx: StagedCallCont
 
 function withStagedMeta(result: CallToolResult, entries: StagedChange[]): CallToolResult {
   const rejected = entries.filter((e) => e.decision !== 'ALLOW');
-  const staged: StagedMeta = { applied: entries.length - rejected.length, rejected: rejected.length, changes: entries };
+  const staged: StagedMeta = {
+    applied: entries.length - rejected.length,
+    rejected: rejected.length,
+    changes: entries.slice(0, MAX_REPORTED_CHANGES),
+    ...(entries.length > MAX_REPORTED_CHANGES ? { truncated: true as const } : {}),
+  };
   const content =
     rejected.length > 0 ? [...result.content, { type: 'text' as const, text: rejectionNote(rejected, staged.applied) }] : result.content;
   return { ...result, content, _meta: { ...result._meta, [STAGED_META_KEY]: staged } };
 }
 
 function rejectionNote(rejected: StagedChange[], applied: number): string {
-  const listed = rejected.slice(0, MAX_NOTE_PATHS).map((e) => `${displayPath(e.path)} (${e.ruleId})`);
-  const more = rejected.length > MAX_NOTE_PATHS ? `, and ${rejected.length - MAX_NOTE_PATHS} more` : '';
+  const listed = rejected.slice(0, MAX_REPORTED_CHANGES).map((e) => `${displayPath(e.path)} (${e.ruleId})`);
+  const more = rejected.length > MAX_REPORTED_CHANGES ? `, ...and ${rejected.length - MAX_REPORTED_CHANGES} more` : '';
   return `${REJECTED_CHANGES_PREFIX}: ${rejected.length} file change(s) made by the tool server were rejected and not applied to the project: ${listed.join(', ')}${more}. ${applied} change(s) were applied.`;
 }
 

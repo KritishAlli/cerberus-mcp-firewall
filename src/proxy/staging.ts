@@ -105,6 +105,11 @@ export interface StagingOptions {
   extraExcludes?: readonly string[];
   /** FileChange.text is filled only for files of at most this many bytes; larger files are never applied. */
   maxFileBytes: number;
+  /**
+   * policy.staging.maxChangesPerCall. diff() stops scanning excluded paths after
+   * this many + 1 entries, so the evaluator's CHANGE_LIMIT rejects the batch. Default 1000.
+   */
+  maxChangesPerCall?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,17 +211,61 @@ export async function snapshot(root: string, excludes: readonly string[] = DEFAU
   return scan(await realpath(root), compileExcludes(excludes));
 }
 
-/** `root` must already be a realpath. Entries are in sorted pre-order: a directory before its contents. */
-async function scan(root: string, rules: ExcludeRule[]): Promise<Manifest> {
+/** Excluded entries found in staging, where they never belong. Bounded by `limit`. */
+interface ExcludedScan {
+  /** Non-directory entries. Not hashed: excluded paths are never in a baseline, so any entry is new. */
+  entries: Manifest;
+  /** Top-most excluded paths (e.g. ".git", "src/.env"): removing these removes everything. */
+  roots: string[];
+  limit: number;
+  /** Non-directory entries seen, unsafe names included. */
+  count: number;
+  dirs: number;
+}
+
+/** A staging entry whose on-disk name cannot be used as a path (see entryName). */
+interface UnsafeEntry {
+  /** Absolute on-disk path, raw bytes. */
+  raw: Buffer;
+  /** Its directory, a safe path. */
+  dir: string;
+  size: number;
+}
+
+/** What a staging scan collects besides the manifest. */
+interface ScanSink {
+  excluded: ExcludedScan;
+  /** Escaped display path → the entry. */
+  unsafe: Map<string, UnsafeEntry>;
+}
+
+/**
+ * `root` must already be a realpath. Entries are in sorted pre-order: a directory
+ * before its contents. Excluded paths and unsafe names are skipped, or collected
+ * into `sink` for a staging diff. Names are read as raw bytes, so even a name that
+ * is not valid UTF-8 can be reported and removed.
+ */
+async function scan(root: string, rules: ExcludeRule[], sink?: ScanSink): Promise<Manifest> {
   const manifest: Manifest = new Map();
   const visit = async (dirRel: string): Promise<void> => {
     const dirAbs = dirRel === '' ? root : path.join(root, ...dirRel.split('/'));
     await assertNoSymlinkInPath(dirAbs);
-    for (const name of (await readdir(dirAbs)).sort()) {
+    for (const raw of await readNames(dirAbs)) {
+      const { name, safe } = entryName(raw, dirRel === '');
       const rel = dirRel === '' ? name : `${dirRel}/${name}`;
+      if (!safe) {
+        if (sink) await recordUnsafe(sink, rel, dirAbs, raw);
+        continue;
+      }
       const { abs } = resolveInRoot(root, rel);
       const st = await lstat(abs);
-      if (matchesExclude(rules, rel, st.isDirectory())) continue;
+      if (matchesExclude(rules, rel, st.isDirectory())) {
+        if (sink) {
+          sink.excluded.roots.push(rel);
+          await collectExcluded(root, rel, abs, st, sink);
+        }
+        continue;
+      }
       const entry = await describe(abs, st);
       manifest.set(rel, entry);
       if (entry.type === 'dir') await visit(rel);
@@ -226,6 +275,64 @@ async function scan(root: string, rules: ExcludeRule[]): Promise<Manifest> {
   return manifest;
 }
 
+/** Walks an excluded subtree until `limit` entries or `limit` directories have been seen. */
+async function collectExcluded(root: string, rel: string, abs: string, st: Stats, sink: ScanSink): Promise<void> {
+  const ex = sink.excluded;
+  const full = (): boolean => ex.count >= ex.limit || ex.dirs >= ex.limit;
+  if (full()) return;
+  if (!st.isDirectory()) {
+    ex.entries.set(rel, await describeUnhashed(abs, st));
+    ex.count++;
+    return;
+  }
+  ex.dirs++;
+  await assertNoSymlinkInPath(abs);
+  for (const raw of await readNames(abs)) {
+    if (full()) return;
+    const { name, safe } = entryName(raw, false);
+    if (!safe) {
+      await recordUnsafe(sink, `${rel}/${name}`, abs, raw);
+      ex.count++;
+      continue;
+    }
+    const child = resolveInRoot(root, `${rel}/${name}`);
+    await collectExcluded(root, child.rel, child.abs, await lstat(child.abs), sink);
+  }
+}
+
+async function readNames(dirAbs: string): Promise<Buffer[]> {
+  return (await readdir(dirAbs, { encoding: 'buffer' })).sort(Buffer.compare);
+}
+
+async function recordUnsafe(sink: ScanSink, rel: string, dir: string, name: Buffer): Promise<void> {
+  const raw = Buffer.concat([Buffer.from(dir + path.sep), name]);
+  sink.unsafe.set(rel, { raw, dir, size: (await lstat(raw)).size });
+}
+
+/**
+ * A directory entry's name for paths and display. Unsafe names (not valid UTF-8,
+ * control characters, backslashes, or a drive prefix at the root) get an escaped
+ * display form instead: every byte outside printable ASCII, and "%", backslash and ":",
+ * becomes %XX. The escaped form is never used to touch the file.
+ */
+function entryName(raw: Buffer, atRoot: boolean): { name: string; safe: boolean } {
+  let decoded: string | undefined;
+  try {
+    decoded = UTF8.decode(raw);
+  } catch {
+    decoded = undefined;
+  }
+  if (decoded !== undefined && !/[\u0000-\u001f\u007f-\u009f\\]/.test(decoded) && !(atRoot && /^[A-Za-z]:/.test(decoded))) {
+    return { name: decoded, safe: true };
+  }
+  let escaped = '';
+  for (const byte of raw) {
+    const plain = byte >= 0x20 && byte <= 0x7e && byte !== 0x25 && byte !== 0x5c && byte !== 0x3a;
+    escaped += plain ? String.fromCharCode(byte) : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+  return { name: escaped, safe: false };
+}
+
 async function describe(abs: string, st: Stats): Promise<ManifestEntry> {
   const mode = st.mode & 0o777;
   if (st.isSymbolicLink()) return { type: 'symlink', size: st.size, mode, linkTarget: await readlink(abs) };
@@ -233,6 +340,14 @@ async function describe(abs: string, st: Stats): Promise<ManifestEntry> {
   if (st.isFile()) {
     return { type: st.nlink > 1 ? 'special' : 'file', size: st.size, mode, sha256: await hashFile(abs, st) };
   }
+  return { type: 'special', size: st.size, mode };
+}
+
+/** describe() without reading file contents. */
+async function describeUnhashed(abs: string, st: Stats): Promise<ManifestEntry> {
+  const mode = st.mode & 0o777;
+  if (st.isSymbolicLink()) return { type: 'symlink', size: st.size, mode, linkTarget: await readlink(abs) };
+  if (st.isFile()) return { type: st.nlink > 1 ? 'special' : 'file', size: st.size, mode };
   return { type: 'special', size: st.size, mode };
 }
 
@@ -328,7 +443,7 @@ function textOrNull(content: Buffer): string | null {
   }
 }
 
-async function lstatIfPresent(abs: string): Promise<Stats | undefined> {
+async function lstatIfPresent(abs: string | Buffer): Promise<Stats | undefined> {
   try {
     return await lstat(abs);
   } catch (err) {
@@ -350,18 +465,29 @@ export async function createStagingArea(options: StagingOptions): Promise<Stagin
   }
   const stagingRoot = await mkdtemp(path.join(parent, 'mcp-firewall-staging-'));
   const excludes = [...(options.excludes ?? DEFAULT_EXCLUDES), ...(options.extraExcludes ?? [])];
-  return new StagingArea(projectRoot, stagingRoot, compileExcludes(excludes), options.maxFileBytes);
+  return new StagingArea(
+    projectRoot,
+    stagingRoot,
+    compileExcludes(excludes),
+    options.maxFileBytes,
+    options.maxChangesPerCall ?? 1000,
+  );
 }
 
 export class StagingArea {
   /** Staging as of the last diff(): what apply() verifies staged content against. */
   private lastScan: Manifest | undefined;
+  /** Top-most excluded paths the last diff() found in staging. */
+  private excludedRoots: string[] = [];
+  /** Entries with unsafe names the last diff() found, by escaped display path. */
+  private lastUnsafe = new Map<string, UnsafeEntry>();
 
   constructor(
     readonly projectRoot: string,
     readonly stagingRoot: string,
     private readonly rules: ExcludeRule[],
     private readonly maxFileBytes: number,
+    private readonly maxChangesPerCall: number,
   ) {}
 
   /** Makes staging an exact mirror of the project minus excludes. */
@@ -373,6 +499,7 @@ export class StagingArea {
       if (!sameEntry(entry, current.get(rel))) await this.copyToStaging(rel, entry);
     }
     this.lastScan = undefined;
+    this.lastUnsafe = new Map();
     return { staging: await scan(this.stagingRoot, this.rules), project };
   }
 
@@ -380,16 +507,33 @@ export class StagingArea {
    * Rescans staging and reports what changed since `before` (from sync()),
    * sorted by path. Directories are not reported; their contents are.
    * `executable` is set for every add, and for modify/mode when the exec bit changed.
+   *
+   * Excluded paths (.git/, node_modules/, .env, …) are never copied into staging,
+   * so anything found under them is a server write and is reported too, up to
+   * maxChangesPerCall + 1 entries. They are not hashed. apply() never applies
+   * them, and removeExcluded() deletes all of them, including any past that bound.
+   *
+   * Entries whose names cannot be handled safely (see entryName) are reported as
+   * kind 'special' under an escaped display path. They are never applied, and
+   * revert() deletes them by their raw on-disk name.
    */
   async diff(before: Manifest): Promise<FileChange[]> {
-    const after = await scan(this.stagingRoot, this.rules);
+    const sink: ScanSink = {
+      excluded: { entries: new Map(), roots: [], limit: this.maxChangesPerCall + 1, count: 0, dirs: 0 },
+      unsafe: new Map(),
+    };
+    const after = await scan(this.stagingRoot, this.rules, sink);
+    for (const [rel, entry] of sink.excluded.entries) after.set(rel, entry);
     this.lastScan = after;
+    this.excludedRoots = sink.excluded.roots;
+    this.lastUnsafe = sink.unsafe;
     const changes: FileChange[] = [];
-    for (const rel of [...new Set([...before.keys(), ...after.keys()])].sort()) {
+    for (const rel of [...new Set([...before.keys(), ...after.keys()])]) {
       const change = await this.changeAt(rel, before.get(rel), after.get(rel));
       if (change) changes.push(change);
     }
-    return changes;
+    for (const [rel, entry] of sink.unsafe) changes.push({ path: rel, kind: 'special', size: entry.size });
+    return changes.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   }
 
   /**
@@ -469,15 +613,76 @@ export class StagingArea {
     return results;
   }
 
-  /** Restores these paths in staging from the project, or removes them if the project has none. */
-  async revert(paths: readonly string[]): Promise<void> {
+  /**
+   * Restores these paths in staging from the project, or removes them if the
+   * project has none (along with any directories left empty that the project
+   * does not have). Returns staging's entries for what was restored, as
+   * baselineAfter() expects them.
+   */
+  async revert(paths: readonly string[]): Promise<Manifest> {
+    const restored: Manifest = new Map();
     for (const p of paths) {
       const { rel, abs } = resolveInRoot(this.stagingRoot, p);
+      const unsafe = this.lastUnsafe.get(rel);
+      if (unsafe) await removeUnsafe(unsafe);
       await this.makeStagingParentsDirs(rel);
       await rm(abs, { recursive: true, force: true });
-      await this.copyTreeToStaging(rel);
+      await this.copyTreeToStaging(rel, restored);
+      if (!restored.has(rel)) await this.pruneEmptyStagingDirs(rel);
     }
-    this.lastScan = undefined;
+    return restored;
+  }
+
+  /** True if the path is excluded from staging: never copied, never applied. */
+  isExcluded(relPath: string): boolean {
+    return isExcludedPath(this.rules, relPath);
+  }
+
+  /** Why a change at this path must be denied whatever the evaluator says, or undefined. */
+  forcedDenyReason(relPath: string): string | undefined {
+    if (this.lastUnsafe.has(relPath)) return 'file name cannot be handled safely';
+    if (isExcludedPath(this.rules, relPath)) return 'path is excluded from staging';
+    return undefined;
+  }
+
+  /** Deletes every excluded path the last diff() found in staging, including any past its scan bound. */
+  async removeExcluded(): Promise<void> {
+    for (const root of this.excludedRoots) {
+      const { rel, abs } = resolveInRoot(this.stagingRoot, root);
+      await this.makeStagingParentsDirs(rel);
+      await rm(abs, { recursive: true, force: true });
+    }
+    this.excludedRoots = [];
+  }
+
+  /**
+   * The baseline after a call, without rescanning or touching staging: `pre.staging`
+   * with each applied change as the last diff() saw it and each other changed path
+   * as `restored` (from revert()) left it. A server write that lands after diff()
+   * therefore still differs from this baseline and shows up in the next catch-up
+   * diff, instead of being absorbed or overwritten. The project is rescanned: the
+   * server cannot write there.
+   */
+  async baselineAfter(
+    pre: SyncResult,
+    results: readonly ApplyResult[],
+    restored: Manifest,
+  ): Promise<SyncResult> {
+    const after = this.lastScan;
+    if (!after) throw new StagingError('baselineAfter() needs a diff() since the last sync()');
+    const staging: Manifest = new Map(pre.staging);
+    for (const r of results) {
+      const { rel } = resolveInRoot(this.stagingRoot, r.path);
+      for (const key of [...staging.keys()]) {
+        if (key === rel || key.startsWith(`${rel}/`)) staging.delete(key);
+      }
+      if (r.applied) {
+        const entry = after.get(rel);
+        if (entry) staging.set(rel, entry);
+      }
+    }
+    for (const [rel, entry] of restored) staging.set(rel, entry);
+    return { staging, project: await scan(this.projectRoot, this.rules) };
   }
 
   /** Removes the staging dir. */
@@ -523,7 +728,20 @@ export class StagingArea {
   /** UTF-8 text without NUL for files of at most maxFileBytes; otherwise null. */
   private async textOf(rel: string, entry: ManifestEntry): Promise<string | null> {
     if (entry.size > this.maxFileBytes) return null;
-    return textOrNull(await readVerified(resolveInRoot(this.stagingRoot, rel).abs, entry));
+    const { abs } = resolveInRoot(this.stagingRoot, rel);
+    if (entry.sha256 !== undefined) return textOrNull(await readVerified(abs, entry));
+    // Unhashed (excluded) entries are always denied: their text only informs the rule ID, so read best effort.
+    try {
+      const handle = await openSame(abs, undefined);
+      try {
+        const content = await handle.readFile();
+        return content.length === entry.size ? textOrNull(content) : null;
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      return null;
+    }
   }
 
   // --- apply --------------------------------------------------------------
@@ -587,7 +805,12 @@ export class StagingArea {
   /** Removes everything in staging the project does not have in the same form, excluded paths included. */
   private async pruneStaging(dirRel: string, project: Manifest): Promise<void> {
     const dirAbs = dirRel === '' ? this.stagingRoot : path.join(this.stagingRoot, ...dirRel.split('/'));
-    for (const name of await readdir(dirAbs)) {
+    for (const raw of await readNames(dirAbs)) {
+      const { name, safe } = entryName(raw, dirRel === '');
+      if (!safe) {
+        await removeUnsafe({ raw: Buffer.concat([Buffer.from(dirAbs + path.sep), raw]), dir: dirAbs, size: 0 });
+        continue;
+      }
       const rel = dirRel === '' ? name : `${dirRel}/${name}`;
       const abs = path.join(dirAbs, name);
       const st = await lstat(abs);
@@ -630,15 +853,40 @@ export class StagingArea {
     }
   }
 
-  private async copyTreeToStaging(rel: string): Promise<void> {
+  /** Copies a project subtree into staging, recording in `restored` what staging now holds. */
+  private async copyTreeToStaging(rel: string, restored: Manifest): Promise<void> {
     if (isExcludedPath(this.rules, rel)) return;
     const src = path.join(this.projectRoot, ...rel.split('/'));
     const entry = await describeIfPresent(src);
     if (entry === undefined) return;
     await this.copyToStaging(rel, entry);
+    // Hardlinked project files arrive as plain files; devices and the like are not copied.
+    if (entry.type === 'special') {
+      if (entry.sha256 !== undefined) restored.set(rel, { ...entry, type: 'file' });
+    } else {
+      restored.set(rel, entry);
+    }
     if (entry.type !== 'dir') return;
-    for (const name of (await readdir(src)).sort()) {
-      await this.copyTreeToStaging(resolveInRoot(this.projectRoot, `${rel}/${name}`).rel);
+    for (const raw of await readNames(src)) {
+      const { name, safe } = entryName(raw, false);
+      // Project entries with unsafe names are never mirrored, like excluded paths.
+      if (safe) await this.copyTreeToStaging(resolveInRoot(this.projectRoot, `${rel}/${name}`).rel, restored);
+    }
+  }
+
+  /** Removes now-empty staging directories above rel that the project does not have as directories. */
+  private async pruneEmptyStagingDirs(rel: string): Promise<void> {
+    const parts = rel.split('/');
+    for (let n = parts.length - 1; n > 0; n--) {
+      const ancestor = parts.slice(0, n);
+      if ((await lstatIfPresent(path.join(this.projectRoot, ...ancestor)))?.isDirectory()) return;
+      try {
+        await rmdir(path.join(this.stagingRoot, ...ancestor));
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'ENOTEMPTY' || code === 'EEXIST' || code === 'ENOENT' || code === 'ENOTDIR') return;
+        throw err;
+      }
     }
   }
 
@@ -653,6 +901,13 @@ export class StagingArea {
       await mkdir(abs);
     }
   }
+}
+
+/** Deletes an unsafe-named entry by its raw name. Throws if it is still there afterwards. */
+async function removeUnsafe(entry: UnsafeEntry): Promise<void> {
+  await assertNoSymlinkInPath(entry.dir);
+  await rm(entry.raw, { recursive: true, force: true });
+  if (await lstatIfPresent(entry.raw)) throw new StagingError('could not remove an entry with an unsafe name');
 }
 
 // ---------------------------------------------------------------------------

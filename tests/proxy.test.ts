@@ -14,7 +14,7 @@
  *    (no Docker). Everything lives in mkdtemp dirs.
  */
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -35,6 +35,7 @@ import {
 } from '../src/proxy/interceptor.js';
 import { startProxyServer, type ProxyServerHandle } from '../src/proxy/server.js';
 import {
+  MAX_REPORTED_CHANGES,
   REJECTED_CHANGES_PREFIX,
   STAGED_META_KEY,
   STAGING_ERROR_PREFIX,
@@ -53,6 +54,7 @@ import {
   type ChangeDecision,
   type EvaluateFileChanges,
   type EvaluateToolCall,
+  type FileChange,
   type FileChangeEvent,
   type FirewallEvent,
   type FirewallPolicy,
@@ -956,6 +958,7 @@ const maliciousPath = resolve(import.meta.dirname, 'fixtures/malicious-server.ts
 const DUMMY_AWS_KEY = 'AKIAIOSFODNN7EXAMPLE';
 
 const PROJECT_FILES: Record<string, string> = {
+  '.env': 'REAL_SECRET=project-only\n',
   'README.md': '# Demo project\n',
   LICENSE: 'MIT\n',
   'docs/guide.md': 'guide\n',
@@ -996,7 +999,7 @@ const stagedArgEvaluator: EvaluateToolCall = (ctx) =>
     : ALLOW;
 
 /** Stand-in for Winston's evaluateFileChanges, so these tests check plumbing, not his rules. */
-const testChangeEvaluator: EvaluateFileChanges = (changes) =>
+const testChangeEvaluator: EvaluateFileChanges = (changes, p) =>
   changes.map((c): ChangeDecision => {
     const d = (decision: 'ALLOW' | 'DENY', ruleId: ChangeDecision['ruleId']): ChangeDecision => ({
       path: c.path,
@@ -1004,6 +1007,7 @@ const testChangeEvaluator: EvaluateFileChanges = (changes) =>
       ruleId,
       reason: 'test rule',
     });
+    if (p.staging && changes.length > p.staging.maxChangesPerCall) return d('DENY', 'CHANGE_LIMIT');
     if (c.path.startsWith('.git/') || c.path.startsWith('.husky/')) return d('DENY', 'PERSISTENCE_PATH');
     if (c.kind === 'symlink') return d('DENY', 'SYMLINK_DENIED');
     if (c.kind === 'special') return d('DENY', 'WRITE_NOT_ALLOWED');
@@ -1024,6 +1028,8 @@ interface StagedOptions {
   onFileChangeEvent?: (event: FileChangeEvent) => void;
   /** false: skip initStaging. */
   init?: boolean;
+  /** Sets policy.staging.maxChangesPerCall and the area's excluded-scan bound. */
+  maxChangesPerCall?: number;
 }
 
 interface StagedStack {
@@ -1044,7 +1050,12 @@ async function startStaged(options: StagedOptions = {}): Promise<StagedStack> {
   const dir = await realpath(await mkdtemp(join(tmpdir(), 'mcp-firewall-staged-')));
   const project = join(dir, 'project');
   await makeProject(project);
-  const area = await createStagingArea({ projectRoot: project, stagingParent: dir, maxFileBytes: 64 * 1024 });
+  const area = await createStagingArea({
+    projectRoot: project,
+    stagingParent: dir,
+    maxFileBytes: 64 * 1024,
+    ...(options.maxChangesPerCall === undefined ? {} : { maxChangesPerCall: options.maxChangesPerCall }),
+  });
   const initial = await area.sync();
   const upstream = await connectUpstream(
     { id: 'mal', command: 'unused', args: [], timeoutMs: options.timeoutMs ?? 10_000 },
@@ -1066,7 +1077,18 @@ async function startStaged(options: StagedOptions = {}): Promise<StagedStack> {
     area: options.wrapArea ? options.wrapArea(area) : area,
     lock: new StagingLock(),
     ...(changeEvaluator === 'default' ? {} : { evaluateFileChanges: changeEvaluator }),
-    policy: fixturePolicy,
+    policy:
+      options.maxChangesPerCall === undefined
+        ? fixturePolicy
+        : {
+            ...fixturePolicy,
+            staging: {
+              writablePaths: ['src/**', 'README.md'],
+              protectedWritePaths: ['.git/**', '.husky/**'],
+              maxFileBytes: 64 * 1024,
+              maxChangesPerCall: options.maxChangesPerCall,
+            },
+          },
     onFileChangeEvent: options.onFileChangeEvent ?? ((e) => fileEvents.push(e)),
   };
   if (options.init !== false) await initStaging(staging, { serverId: 'mal', initial, log: (l) => logs.push(l) });
@@ -1112,6 +1134,9 @@ function wrapped(area: StagingArea, calls: string[], override: Partial<StagingAr
     diff: (before) => (calls.push('diff'), override.diff ? override.diff(before) : area.diff(before)),
     apply: (c, d, p) => (calls.push('apply'), override.apply ? override.apply(c, d, p) : area.apply(c, d, p)),
     revert: (paths) => (calls.push('revert'), override.revert ? override.revert(paths) : area.revert(paths)),
+    forcedDenyReason: (path) => area.forcedDenyReason(path),
+    removeExcluded: () => (calls.push('removeExcluded'), area.removeExcluded()),
+    baselineAfter: (pre, results, restored) => (calls.push('baselineAfter'), area.baselineAfter(pre, results, restored)),
   };
 }
 
@@ -1175,8 +1200,9 @@ describe('proxy / staged writes', () => {
 
     expect(stagedOf(result)).toEqual({
       applied: 1,
-      rejected: 5,
+      rejected: 6,
       changes: [
+        { path: '.git/hooks/pre-commit', decision: 'DENY', ruleId: 'PERSISTENCE_PATH' },
         { path: '.husky/pre-commit', decision: 'DENY', ruleId: 'PERSISTENCE_PATH' },
         { path: 'LICENSE', decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' },
         { path: 'README.md', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' },
@@ -1185,7 +1211,7 @@ describe('proxy / staged writes', () => {
         { path: 'src/run.sh', decision: 'DENY', ruleId: 'EXECUTABLE_DENIED' },
       ],
     });
-    // .git/ is excluded from staging, so the .git hook is never diffed, applied or reported.
+    // .git/ is excluded from staging: the hook is reported and denied, never applied, and removed from staging.
     expect(await exists(join(stack.project, '.git'))).toBe(false);
 
     const after = await fingerprint(stack.project);
@@ -1198,6 +1224,7 @@ describe('proxy / staged writes', () => {
     expect(result.content[0]).toEqual({ type: 'text', text: 'README formatted' });
     const note = result.content[1];
     expect(note?.type === 'text' && note.text.startsWith(REJECTED_CHANGES_PREFIX)).toBe(true);
+    expect(allText(result)).toContain('.git/hooks/pre-commit (PERSISTENCE_PATH)');
     expect(allText(result)).toContain('.husky/pre-commit (PERSISTENCE_PATH)');
     expect(allText(result)).toContain('src/config.ts (SECRET_DETECTED)');
     expect(allText(result)).not.toContain(DUMMY_AWS_KEY);
@@ -1445,5 +1472,178 @@ describe('proxy / staged writes', () => {
     expect(raw).not.toContain(DUMMY_AWS_KEY);
     expect(raw).not.toContain('"text"');
     expect(raw).not.toContain('export const');
+  });
+
+  it('a server-written .env is reported and denied even when the evaluator allows it, and never applied', async () => {
+    const allowAll: EvaluateFileChanges = (changes) =>
+      changes.map((c) => ({ path: c.path, decision: 'ALLOW', ruleId: 'APPROVED_TOOL', reason: 'allow all' }));
+    let seen: FileChange[] = [];
+    stack = await startStaged({
+      changeEvaluator: (changes, p) => {
+        seen = changes;
+        return allowAll(changes, p);
+      },
+    });
+    const result = await stack.handler('write_file', { path: '.env', content: 'SERVER_SECRET=planted\n' });
+    expect(seen).toEqual([{ path: '.env', kind: 'add', size: 22, executable: false, text: 'SERVER_SECRET=planted\n' }]);
+    expect(stagedOf(result)?.changes).toEqual([{ path: '.env', decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' }]);
+    expect(await readFile(join(stack.project, '.env'), 'utf8')).toBe('REAL_SECRET=project-only\n');
+    expect(await exists(join(stack.area.stagingRoot, '.env'))).toBe(false);
+    expect(JSON.stringify(stack.fileEvents)).not.toContain('planted');
+  });
+
+  it('a node_modules flood above maxChangesPerCall is rejected as a batch without scanning it all', async () => {
+    stack = await startStaged({ maxChangesPerCall: 10 });
+    const started = Date.now();
+    const result = await stack.handler('flood_node_modules', { count: 500 });
+    const staged = stagedOf(result)!;
+    expect(staged.changes).toHaveLength(11);
+    expect(staged).toMatchObject({ applied: 0, rejected: 11 });
+    expect(staged.changes.every((c) => c.decision === 'DENY' && c.ruleId === 'CHANGE_LIMIT')).toBe(true);
+    expect(await exists(join(stack.area.stagingRoot, 'node_modules'))).toBe(false);
+    expect(await exists(join(stack.project, 'node_modules'))).toBe(false);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    // Staging is clean again: the next call sees only its own change.
+    const next = await stack.handler('write_file', { path: 'src/a.ts', content: 'a\n' });
+    expect(stagedOf(next)?.changes).toEqual([{ path: 'src/a.ts', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' }]);
+  });
+
+  it(`caps _meta changes and the note at ${MAX_REPORTED_CHANGES}, with true totals`, async () => {
+    stack = await startStaged();
+    const result = await stack.handler('write_many', { count: 230 });
+    const staged = stagedOf(result)!;
+    expect(staged).toMatchObject({ applied: 115, rejected: 115, truncated: true });
+    expect(staged.changes).toHaveLength(MAX_REPORTED_CHANGES);
+    expect(allText(result)).toContain('...and 15 more');
+    expect(stack.fileEvents[0]?.changes).toHaveLength(20);
+
+    const small = await stack.handler('write_file', { path: 'src/one.ts', content: '1\n' });
+    expect(stagedOf(small)).not.toHaveProperty('truncated');
+  });
+
+  it('unsafe file names are reported, denied even when allowed, removed, and do not break staging', async () => {
+    let seen: FileChange[] = [];
+    stack = await startStaged({
+      changeEvaluator: (changes) => {
+        seen = changes;
+        return changes.map((c) => ({ path: c.path, decision: 'ALLOW', ruleId: 'APPROVED_TOOL', reason: 'allow all' }));
+      },
+    });
+    const result = await stack.handler('write_unsafe_names', {});
+    expect(seen).toEqual([
+      { path: '.git/evil%5Cname', kind: 'special', size: 1 },
+      { path: 'src/a%5Cb.ts', kind: 'special', size: 1 },
+      { path: 'src/bad%1Bname', kind: 'special', size: 1 },
+    ]);
+    expect(stagedOf(result)?.changes).toEqual([
+      { path: '.git/evil%5Cname', decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' },
+      { path: 'src/a%5Cb.ts', decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' },
+      { path: 'src/bad%1Bname', decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' },
+    ]);
+    const rawNames = (await readdir(join(stack.area.stagingRoot, 'src'), { encoding: 'buffer' })).map((b) => b.toString('latin1'));
+    expect(rawNames.sort()).toEqual(['app.ts', 'run.sh']);
+    expect(await exists(join(stack.area.stagingRoot, '.git'))).toBe(false);
+    expect((await readdir(join(stack.project, 'src'))).sort()).toEqual(['app.ts', 'run.sh']);
+
+    // Escaped everywhere: no raw ESC or backslash in the note, events or logs.
+    const reported = [allText(result), JSON.stringify(stack.fileEvents), stack.logs.join('\n')].join('\n');
+    expect(reported).not.toContain('\u001b');
+    expect(reported).not.toMatch(/evil\\name|a\\b\.ts/);
+    expect(stack.fileEvents.flatMap((e) => e.changes.map((c) => c.path))).toEqual([
+      '.git/evil%5Cname',
+      'src/a%5Cb.ts',
+      'src/bad%1Bname',
+    ]);
+
+    const next = await stack.handler('write_file', { path: 'src/ok.ts', content: 'ok\n' });
+    expect(next.isError).toBeFalsy();
+    expect(stagedOf(next)?.changes).toEqual([{ path: 'src/ok.ts', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' }]);
+  });
+
+  it('a large excluded file is reported with its size, never read, rejected and removed', async () => {
+    let seen: FileChange[] = [];
+    stack = await startStaged({
+      changeEvaluator: (changes, p) => {
+        seen = changes;
+        return testChangeEvaluator(changes, p);
+      },
+    });
+    const bytes = 3 * 1024 * 1024;
+    // Mode 000: any open() of it during the diff would fail and break staging.
+    const result = await stack.handler('write_big_unreadable', { path: 'node_modules/big/blob.bin', bytes });
+    expect(result.isError).toBeFalsy();
+    expect(seen).toEqual([{ path: 'node_modules/big/blob.bin', kind: 'add', size: bytes, executable: false, text: null }]);
+    expect(stagedOf(result)?.changes).toEqual([
+      { path: 'node_modules/big/blob.bin', decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' },
+    ]);
+    expect(await exists(join(stack.area.stagingRoot, 'node_modules'))).toBe(false);
+    expect(await exists(join(stack.project, 'node_modules'))).toBe(false);
+  });
+
+  it('an apply() from a diff taken before revert() and baselineAfter() fails its hash check and changes nothing', async () => {
+    stack = await startStaged();
+    const { area } = stack;
+    const pre = await area.sync();
+    await writeFile(join(area.stagingRoot, 'README.md'), 'server edit\n');
+    const changes = await area.diff(pre.staging);
+    expect(changes.map((c) => c.path)).toEqual(['README.md']);
+    const restored = await area.revert(changes.map((c) => c.path));
+    await area.baselineAfter(
+      pre,
+      changes.map((c) => ({ path: c.path, applied: false, ruleId: 'WRITE_NOT_ALLOWED' })),
+      restored,
+    );
+    const before = await fingerprint(stack.project);
+    const stale = changes.map((c): ChangeDecision => ({ path: c.path, decision: 'ALLOW', ruleId: 'APPROVED_TOOL', reason: 'stale' }));
+    await expect(area.apply(changes, stale, pre.project)).rejects.toThrow(/changed after it was scanned/);
+    expect(await fingerprint(stack.project)).toEqual(before);
+    expect(await readFile(join(stack.project, 'README.md'), 'utf8')).toBe('# Demo project\n');
+  });
+
+  it('emits FileChangeEvents only when there are changes', async () => {
+    stack = await startStaged();
+    expect(stack.fileEvents).toEqual([]);
+    const result = await stack.handler('noop', {});
+    expect(stagedOf(result)).toEqual({ applied: 0, rejected: 0, changes: [] });
+    expect(stack.fileEvents).toEqual([]);
+  });
+
+  it('a write landing after the post-call diff is caught by the next catch-up, not overwritten', async () => {
+    let diffs = 0;
+    let stagingRoot = '';
+    stack = await startStaged({
+      wrapArea: (a) =>
+        wrapped(a, [], {
+          // diff #1 is initStaging, #2 the first call's catch-up, #3 its post-call diff.
+          diff: async (before) => {
+            const changes = await a.diff(before);
+            if (++diffs === 3) {
+              const deadline = Date.now() + 5_000;
+              while (!(await exists(join(stagingRoot, 'src/late.ts'))) || !(await exists(join(stagingRoot, '.husky/late')))) {
+                if (Date.now() > deadline) throw new Error('late write never landed');
+                await new Promise((r) => setTimeout(r, 10));
+              }
+            }
+            return changes;
+          },
+        }),
+    });
+    stagingRoot = stack.area.stagingRoot;
+    const first = await stack.handler('late_write', { delayMs: 50 });
+    expect(stagedOf(first)?.changes).toEqual([]);
+
+    const second = await stack.handler('noop', {});
+    expect(stagedOf(second)?.changes).toEqual([]);
+    expect(stack.fileEvents.map((e) => [e.toolName, e.changes])).toEqual([
+      [
+        '<late-writes>',
+        [
+          { path: '.husky/late', decision: 'DENY', ruleId: 'PERSISTENCE_PATH' },
+          { path: 'src/late.ts', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' },
+        ],
+      ],
+    ]);
+    expect(await exists(join(stack.project, 'src/late.ts'))).toBe(true);
+    expect(await exists(join(stack.project, '.husky/late'))).toBe(false);
   });
 });
