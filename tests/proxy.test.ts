@@ -8,8 +8,10 @@
  * 3. CLI smoke: spawn src/index.ts with a temp config and read the fixture's counts file.
  * 4. CLI with Kritish's demo/mock-server.ts as the downstream, the shipped config/firewall.yaml
  *    policy and Winston's real evaluator (read-only use of demo/* and src/security/*).
+ * 5. Vertical slice: CLI → interceptor → publishEvent → event bus → monitor SSE on a free port.
  */
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/client';
@@ -811,5 +813,118 @@ describe('proxy / CLI with demo/mock-server.ts and config/firewall.yaml policy',
     expect(stderr).toContain('[firewall] protecting MCP server "demo"');
     expect(stderr).not.toContain(MOCK_DUMMY_SECRET);
     expect(stderr).not.toContain(ARG_SECRET);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Vertical slice: src/index.ts → interceptor → publishEvent → event bus → monitor SSE
+// (tests/monitor.test.ts covers the monitor against its own bus; this covers the wiring.)
+// ---------------------------------------------------------------------------
+
+/** A loopback port that was free a moment ago (the schema does not accept port 0). */
+async function freePort(): Promise<number> {
+  return new Promise((resolvePort, reject) => {
+    const server = createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address() as { port: number };
+      server.close(() => resolvePort(port));
+    });
+  });
+}
+
+/** Reads the SSE stream until the monitor's `ready` marker, then disconnects. */
+async function readSseBacklog(url: string): Promise<{ event: string; data: unknown }[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let raw = '';
+    while (!/event: ready\n/.test(raw)) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      raw += decoder.decode(value, { stream: true });
+    }
+    controller.abort();
+    return raw
+      .split('\n\n')
+      .map((block) => {
+        const event = /^event: (.*)$/m.exec(block)?.[1];
+        const data = /^data: (.*)$/m.exec(block)?.[1];
+        return event && data ? { event, data: JSON.parse(data) as unknown } : undefined;
+      })
+      .filter((e): e is { event: string; data: unknown } => e !== undefined);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+describe('proxy / vertical slice: CLI → monitor SSE', () => {
+  let dir: string;
+  let monitorUrl: string;
+  let agent: Client;
+  let stderr = '';
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-firewall-slice-'));
+    const port = await freePort();
+    monitorUrl = `http://127.0.0.1:${port}`;
+    const configPath = join(dir, 'firewall.yaml');
+    const config = {
+      server: {
+        id: 'demo',
+        command: process.execPath,
+        args: ['--import', 'tsx', resolve(repoRoot, 'demo/mock-server.ts')],
+        cwd: repoRoot,
+        timeoutMs: 10_000,
+      },
+      monitor: { enabled: true, host: '127.0.0.1', port, maxEvents: 100 },
+      policy: loadConfig(resolve(repoRoot, 'config/firewall.yaml')).policy,
+    };
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', resolve(repoRoot, 'src/index.ts'), '--config', configPath],
+      cwd: repoRoot,
+      stderr: 'pipe',
+    });
+    transport.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
+    agent = new Client({ name: 'slice-agent', version: '0.0.0' });
+    await agent.connect(transport);
+  });
+
+  afterAll(async () => {
+    await agent?.close().catch(() => {});
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('GET /events replays exactly the allowed and the denied call, with no argument values', async () => {
+    expect(stderr).toContain(`[firewall] monitor listening on ${monitorUrl}`);
+    const health = (await (await fetch(`${monitorUrl}/health`)).json()) as { status: string; protectedServers: number };
+    expect(health).toEqual({ status: 'ok', protectedServers: 1 });
+
+    const allowed = (await agent.callTool({ name: 'read_project_file', arguments: { path: 'README.md' } })) as CallToolResult;
+    const denied = (await agent.callTool({
+      name: 'read_sensitive_file',
+      arguments: { path: '~/.aws/credentials', note: ARG_SECRET },
+    })) as CallToolResult;
+    expect(allowed.isError).toBeFalsy();
+    expect(textOf(denied).startsWith(BLOCKED_PREFIX)).toBe(true);
+
+    const sse = await readSseBacklog(`${monitorUrl}/events`);
+    const events = sse.filter((e) => e.event === 'firewall').map((e) => e.data as FirewallEvent);
+    expect(events.map((e) => [e.toolName, e.decision, e.ruleId])).toEqual([
+      ['read_project_file', 'ALLOW', 'APPROVED_TOOL'],
+      ['read_sensitive_file', 'DENY', 'PROTECTED_PATH'],
+    ]);
+    expect(events[1]?.requestId).toBe(metaOf(denied)?.requestId);
+    for (const e of events) expect(FirewallEventSchema.safeParse(e).success).toBe(true);
+    expect(sse.find((e) => e.event === 'counts')?.data).toEqual({ inspected: 2, allowed: 1, denied: 1 });
+
+    // T11: nothing from the arguments or the mock's secret reaches the stream.
+    const raw = JSON.stringify(sse);
+    for (const value of ['README.md', 'credentials', ARG_SECRET, MOCK_DUMMY_SECRET]) expect(raw).not.toContain(value);
   });
 });
