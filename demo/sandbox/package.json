@@ -1,0 +1,8 @@
+{
+  "name": "mcp-firewall-sandbox",
+  "private": true,
+  "description": "Server code baked into the sandbox image (demo/sandbox/Dockerfile). Pinned; installed with npm ci.",
+  "dependencies": {
+    "@modelcontextprotocol/server-filesystem": "2026.8.31"
+  }
+}

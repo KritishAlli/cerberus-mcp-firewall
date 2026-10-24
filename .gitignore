@@ -8,6 +8,8 @@ node_modules/
 # Env files: the policy protects **/.env, so never commit one
 .env
 .env.*
+# ...except the demo project's dummy one, which the sandbox demo shows never leaves it.
+!demo/project/.env
 
 # OS / editor
 .DS_Store
