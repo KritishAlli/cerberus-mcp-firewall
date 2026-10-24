@@ -1,10 +1,18 @@
-# Dependencies: install with `npm ci` (package-lock.json is committed)
+# Dependencies
 node_modules/
 
-# Logs and tool output
-npm-debug.log*
-*.tsbuildinfo
-coverage/
+# Logs, including the optional redacted JSONL event log (design §8)
+*.log
+*.jsonl
 
-# OS files
+# Env files: the policy protects **/.env, so never commit one
+.env
+.env.*
+
+# OS / editor
 .DS_Store
+.vscode/
+.idea/
+
+# Test coverage
+coverage/
