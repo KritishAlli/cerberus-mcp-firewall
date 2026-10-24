@@ -42,13 +42,14 @@ import {
   SERVER_OUTPUT_PREFIX,
   STAGED_META_KEY,
   STAGING_ERROR_PREFIX,
+  defaultEvaluateFileChanges,
   initStaging,
   type StagedMeta,
   type StagingAreaLike,
   type StagingDeps,
 } from '../src/proxy/staged-call.js';
 import { StagingLock, createStagingArea, snapshot, type StagingArea } from '../src/proxy/staging.js';
-import { evaluateFileChangesStub } from '../src/proxy/stubs/evaluate-file-changes.stub.js';
+import { evaluateFileChanges } from '../src/security/changes.js';
 import { UpstreamUnavailableError, connectUpstream, type UpstreamConnection } from '../src/proxy/upstream.js';
 import {
   FirewallEventSchema,
@@ -1103,7 +1104,7 @@ const testChangeEvaluator: EvaluateFileChanges = (changes, p) =>
   });
 
 interface StagedOptions {
-  /** 'default' leaves evaluateFileChanges out of StagingDeps (the reject-all stub). */
+  /** 'default' leaves evaluateFileChanges out of StagingDeps (src/security's evaluateFileChanges). */
   changeEvaluator?: EvaluateFileChanges | 'default';
   timeoutMs?: number;
   startupTamper?: boolean;
@@ -1508,12 +1509,16 @@ describe('proxy / staged writes', () => {
     }
   });
 
-  it('the default evaluator (reject-all stub) rejects every change', async () => {
-    expect(evaluateFileChangesStub([{ path: 'a', kind: 'add' }], fixturePolicy)[0]?.ruleId).toBe('WRITE_NOT_ALLOWED');
-    stack = await startStaged({ changeEvaluator: 'default' });
-    const result = await stack.handler('write_file', { path: 'src/a.ts', content: 'a\n' });
-    expect(stagedOf(result)?.changes).toEqual([{ path: 'src/a.ts', decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' }]);
-    expect(await exists(join(stack.project, 'src/a.ts'))).toBe(false);
+  it('the default evaluator is evaluateFileChanges and follows policy.staging', async () => {
+    expect(defaultEvaluateFileChanges).toBe(evaluateFileChanges);
+    // maxChangesPerCall gives the policy a staging section (writable: src/**, README.md).
+    stack = await startStaged({ changeEvaluator: 'default', maxChangesPerCall: 20 });
+    const allowed = await stack.handler('write_file', { path: 'src/a.ts', content: 'a\n' });
+    expect(stagedOf(allowed)?.changes).toEqual([{ path: 'src/a.ts', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' }]);
+    expect(await readFile(join(stack.project, 'src/a.ts'), 'utf8')).toBe('a\n');
+    const denied = await stack.handler('write_file', { path: 'notes.txt', content: 'n\n' });
+    expect(stagedOf(denied)?.changes).toEqual([{ path: 'notes.txt', decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' }]);
+    expect(await exists(join(stack.project, 'notes.txt'))).toBe(false);
   });
 
   it('12. concurrent allowed calls are serialized', async () => {
