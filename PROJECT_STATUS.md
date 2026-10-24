@@ -1,11 +1,19 @@
 # Project status: proxy and enforcement (Aarav)
 
-Merged to `main` (PRs #2, #7, #9, #10). In progress on `aarav/staging`: `src/proxy/staging.ts` (not yet merged). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
+Merged to `main` (PRs #2, #7, #9, #10, #11). In progress on `aarav/docker-upstream`: Docker launch mode in `src/proxy/upstream.ts` (not yet merged). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ## Done
 
 - **`src/proxy/interceptor.ts`**: `createInterceptor(deps)` does validate → clone + deep-freeze → evaluate (schema-checked, fail closed) → publish exactly one event → forward only on ALLOW. It returns a recognizable BLOCKED tool error on DENY and a fixed-message DOWNSTREAM ERROR when the downstream fails.
 - **`src/proxy/upstream.ts`**: `connectUpstream(config, { onClose? })` spawns the server over stdio with a safe default env and re-emits its stderr with a prefix. It has a connect timeout, per-call `timeout`/`maxTotalTimeout`/`signal`, paginated `listTools` (20-page cap), a `connected` getter, and `UpstreamUnavailableError` once closed. No reconnect.
+  - **Docker launch mode** (on `aarav/docker-upstream`): `connectUpstream(server, { launch })` takes an exported, Zod-validated `UpstreamLaunch`. It is either `{ mode: 'local', command, args, env?, cwd? }` (the old behavior, built by `localLaunch(server)`) or `{ mode: 'docker', image, command, args, workspaceDir, serverDir?, env?, user?, memory?, pidsLimit? }`.
+  - Docker mode runs the plan's locked-down container: `--network none --read-only --cap-drop ALL --security-opt no-new-privileges`, host `uid:gid`, pids 128, 512m, tmpfs `/tmp`, staging rw at `/workspace`, server code ro at `/server`, and only explicit `-e` vars. `buildDockerArgs(launch)` builds the argv. It is exported, unit-tested and never uses a shell.
+  - Preflight runs `docker version`, then `docker image inspect`. If either fails it throws `SandboxUnavailableError` and refuses to start. It never pulls and never falls back to local mode.
+  - The container is removed with `docker rm -f` on close, on a downstream close, on process exit, and on SIGINT/SIGTERM. Container stderr goes to our stderr as `[upstream:<id>] …`.
+  - `upstream.launch` / `describeLaunch()` report `{ mode, image?, containerName?, sandboxed }` for the monitor and `/health`. Not wired in yet.
+  - `src/index.ts` now passes `launch: localLaunch(config.server)` explicitly. No new config keys; behavior is unchanged.
+  - See [DECISIONS §11](docs/DECISIONS.md).
+- **`tests/upstream-docker.test.ts`**: 29 unit tests that need no Docker: the exact argv and its order, defaults, every rejection case, env passthrough only when explicit, preflight failures that never spawn, no pull, and container removal on close. There are also 3 integration tests (real `node:22-slim` container: tools through the proxy, no network, writes only to `/workspace` and `/tmp`). They are **skipped on this machine because Docker isn't installed, so they have never been run**. Fixture: `tests/fixtures/docker-server.mjs`.
 - **`src/proxy/server.ts`**: `startProxyServer(upstream, handler, { transport?, onClose? })` is a low-level `Server`. `tools/list` passes through unchanged, `tools/call` goes to the interceptor with the cancellation signal, and downstream `instructions` are not forwarded.
 - **`src/index.ts`**: passes the signal through, and shuts down cleanly on agent disconnect, stdin end, SIGINT or SIGTERM (2 s cap), closing the upstream, proxy and monitor. A downstream crash keeps the proxy up and fails closed. Kritish's PR #6 added one line wiring `/health` to live state: `monitor?.setProtectedServers(() => (upstream.connected ? 1 : 0))`. Reviewed: correct, and the optional chaining keeps enforcement independent of the monitor.
 - **`tests/fixtures/counting-server.ts`**: test-only stdio server (`echo`, `read_file`, `structured`, `tool_error`, `hang`, `crash`, `get_call_counts`) with an optional `--counts-file`.
@@ -17,7 +25,7 @@ Merged to `main` (PRs #2, #7, #9, #10). In progress on `aarav/staging`: `src/pro
 
   Also exported: `snapshot(root)`, `resolveInRoot(root, rel)` (the single path-safety check) and `StagingLock` (async mutex for the interceptor). Every error is thrown to the caller, with no paths or contents in messages. Node built-ins only. See [DECISIONS §10](docs/DECISIONS.md).
 - **`tests/staging.test.ts`**: 24 tests against real temp dirs: excludes, symlinks and hardlinks, text rules, path escapes, atomic apply, conflicts, defense in depth, revert, ordering and the lock.
-- **`tests/proxy.test.ts`**: 67 tests in tests/proxy.test.ts; full suite 157 passing (67 proxy, 28 contract, 14 security, 16 events, 8 monitor, 24 staging), 8 todo (all in `tests/e2e.test.ts`). Coverage:
+- **`tests/proxy.test.ts`**: 67 tests in tests/proxy.test.ts; full suite 186 passing (67 proxy, 28 contract, 14 security, 16 events, 8 monitor, 24 staging, 29 upstream-docker), 3 skipped (Docker integration), 8 todo (all in `tests/e2e.test.ts`). Coverage:
   - unit tests (T01, T02, T06, T09, T11, fail-closed evaluator and publish, arg mutation, summary bounds, signal)
   - integration through the real stdio fixture (listing identical to direct, T01/T02 counts, structured results and tool errors, unknown tools, hang timeout, crash)
   - CLI smoke test of `src/index.ts`. With the real evaluator, its approved `fixture/echo` call now takes the forwarded (ALLOW) branch.
@@ -87,7 +95,7 @@ From `src/proxy/interceptor.ts`:
 
 - ~~`src/security/evaluator.ts` is the deny-all stub~~: Winston's real evaluator landed on `main` in PR #4 (`40ea8e4`). With the shipped policy it returns ALLOW / PROTECTED_PATH / DENIED_DESTINATION / DENIED_TOOL for the four demo calls, consistent with design §7.
 - ~~`demo/mock-server.ts` is a stub~~: landed in PR #3 (`6a7f51d`).
-- **Release gate (§10): all three commands pass** on this machine: `npm run typecheck`, `npm test` (157 passed, 8 todo) and `npm run demo` (DEMO PASSED, all 12 checks).
+- **Release gate (§10): all three commands pass** on this machine: `npm run typecheck`, `npm test` (186 passed, 3 skipped without Docker, 8 todo) and `npm run demo` (DEMO PASSED, all 12 checks).
 - **Open policy issues for Winston** (found in a read-only review; no proxy change needed):
   - case-variant protected paths are allowed on macOS
   - relative-path traversal is not resolved
@@ -119,9 +127,11 @@ From `src/proxy/interceptor.ts`:
    - implement `tests/e2e.test.ts`
    - move "Claude Code setup (verified)" into the README and fix the stale status line
    - switch the demo's block detection to `_meta['mcp-firewall/decision']`
+   - **integration:** have the config loader map `server.sandbox` onto `UpstreamLaunch` (exported from `src/proxy/upstream.ts`, with TSDoc on every field) and pass it as `connectUpstream(config.server, { launch })` in `src/index.ts`. Docker mode is selected only that way.
 5. ~~Shutdown hook for the monitor~~: already in place. `src/index.ts` closes it on shutdown, and port 3000 is freed after SIGINT.
 6. **Staged writes:**
    - ~~Contract PR~~: merged (PR #10). See [DECISIONS §9](docs/DECISIONS.md).
-   - ~~`src/proxy/staging.ts`~~: built and tested on `aarav/staging`.
+   - ~~`src/proxy/staging.ts`~~: merged (PR #11).
+   - ~~Docker launch mode in upstream~~: built on `aarav/docker-upstream`. Its integration tests still need a run on a machine with Docker and `node:22-slim`.
    - **Next: interceptor integration.** Take the `StagingLock`, then sync, forward, and diff after every allowed call (including timeout and error). Then `evaluateFileChanges` (the stub until Winston's lands), apply/revert, the result note, `_meta['mcp-firewall/staged']` and the `FileChangeEvent`. Fail closed on any staging error.
 7. Optional, after acceptance tests: forward `list_changed`. Consider logging a clearer warning when the monitor port is taken, e.g. "events from this instance will not appear in the browser", and logging only the error code instead of the full `EADDRINUSE` object and stack.
