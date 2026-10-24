@@ -180,3 +180,13 @@ Residual risk: Node has no `openat`, so a symlink swapped into a *parent* direct
 - or, with no usable owner file (older layout, or a crash before the file was written), its mtime is more than 24 hours old.
 
 A reused pid keeps a dead instance's dir until that process exits too: the guard errs toward keeping. The sweep logs the count and names only, and its failures are logged and never block startup.
+
+## 14. Staged-change policy is deterministic and block-only
+
+`src/security/changes.ts` implements the Winston-owned `EvaluateFileChanges` contract. It validates the policy and every `FileChange`, requires a staging policy, applies the configured batch bound, then evaluates each path in order: globally protected paths, persistence paths, writable-path allowlist, symlink/special-file denial, executable-bit denial, size bound, and secret-pattern scan. A change is ALLOWed only when it passes every check. The reason strings are fixed safe text; neither file contents nor matched secret material is returned. `staged-call.ts` continues to validate output and force-deny excluded paths independently, so the evaluator is not the only defense.
+
+The current user interaction is **block-only**. Cerberus does not provide a “Allow once” dialog yet, and the evaluator has no approval override. If a future client adapter adds one, approval must bind to one pending request ID, expire when that request ends, be recorded without arguments or contents, and never mutate persistent policy. No choice, timeout, dismissal, adapter failure, or malformed approval response means DENY. Do not add a broad “trust tool” control without a separate team decision and threat review.
+
+Secret detection is heuristic, not proof that a file contains no secret. It recognizes several common credential formats and high-entropy tokens only when bounded text is available. Binary, oversized, deleted, or otherwise unreadable contents cannot be inspected by that heuristic; path policy and staged-write restrictions remain necessary. Symlink/special changes and executable changes are denied regardless of writable-path configuration.
+
+Path policy matching also strips trailing separators, decodes up to eight percent-encoding layers before root checks, and compares case-insensitively on macOS and Windows. The latter may over-block on a case-sensitive macOS volume, which is safer than allowing a case-variant protected path on the common case-insensitive volume. `file://` references are treated as local paths only for an empty or `localhost` authority; remote file authorities are denied. The tool evaluator checks explicit denial and protected paths before session taint, so the most specific path rule is reported for a protected-path attempt in a tainted session.

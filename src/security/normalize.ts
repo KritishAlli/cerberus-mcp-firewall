@@ -12,8 +12,12 @@ function expandHome(value: string): string {
 export function normalizePath(value: string): string {
   const expanded = expandHome(value.trim()).replace(/\\/g, '/');
   const winDrive = /^([A-Za-z]):\/(.*)$/.exec(expanded);
-  if (winDrive) return `${winDrive[1]!.toLowerCase()}:/${path.posix.normalize(`/${winDrive[2]!}`).slice(1)}`;
-  return path.posix.normalize(expanded);
+  if (winDrive) {
+    const normalized = `${winDrive[1]!.toLowerCase()}:/${path.posix.normalize(`/${winDrive[2]!}`).slice(1)}`;
+    return normalized.length > 3 ? normalized.replace(/\/+$/, '') : normalized;
+  }
+  const normalized = path.posix.normalize(expanded);
+  return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized;
 }
 
 function globRegex(pattern: string): RegExp {
@@ -28,7 +32,9 @@ function globRegex(pattern: string): RegExp {
     else if (c === '?') out += '[^/]';
     else out += c.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
   }
-  return new RegExp(`${out}$`, process.platform === 'win32' ? 'i' : '');
+  // Default macOS volumes are case-insensitive. Matching case-insensitively
+  // avoids policy bypasses for `.ENV` / `.Env` paths on those developer machines.
+  return new RegExp(`${out}$`, process.platform === 'win32' || process.platform === 'darwin' ? 'i' : '');
 }
 
 /** Match a normalized path against a path-aware glob (`*` stays in one segment, `**` crosses segments). */
@@ -98,7 +104,7 @@ export function pathWithinRoots(value: string, roots: readonly string[]): boolea
     if (root === '/') return candidate.startsWith('/');
     if (root === '.') return !candidate.startsWith('/') && !/^[a-z]:\//i.test(candidate);
     if (!root) return false;
-    const insensitive = process.platform === 'win32' || /^[a-z]:\//i.test(root) || /^[a-z]:\//i.test(candidate);
+    const insensitive = process.platform === 'win32' || process.platform === 'darwin' || /^[a-z]:\//i.test(root) || /^[a-z]:\//i.test(candidate);
     const left = insensitive ? candidate.toLowerCase() : candidate;
     const right = insensitive ? root.toLowerCase() : root;
     return left === right || left.startsWith(`${right}/`);
@@ -106,7 +112,19 @@ export function pathWithinRoots(value: string, roots: readonly string[]): boolea
 }
 
 function decodePath(value: string): string {
-  try { return decodeURIComponent(value); } catch { return value; }
+  let decoded = value;
+  // Decode bounded layers so double-encoded dot segments and separators cannot
+  // evade a root check when a downstream path consumer decodes more than once.
+  for (let i = 0; i < 8; i++) {
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      break;
+    }
+  }
+  return decoded;
 }
 
 export interface StringReference { value: string; start: number; end: number }
