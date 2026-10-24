@@ -20,7 +20,7 @@ npm run check      # typecheck + tests (must stay green on main)
 | `npm test` | Vitest, all `tests/*.test.ts` |
 | `npm start` | Runs the firewall as a stdio MCP server using `config/firewall.yaml` |
 | `npm run mock-server` | Runs the controlled demo MCP server on its own |
-| `npm run demo` | Deterministic benign + blocked scenarios with the live monitor |
+| `npm run demo` | Deterministic benign + blocked scenarios, then checks the same calls arrived on that gateway's monitor |
 
 Release gate (design §10): `npm run typecheck`, `npm test` and `npm run demo` all succeed on one clean laptop.
 
@@ -66,7 +66,13 @@ Edit only the files you own. Changes to **shared** files need a quick agreement 
 
 ## Configure an agent client
 
-Follow the verified Codex setup and sandbox instructions in [`docs/cerberus.md`](docs/cerberus.md). Client configuration is specific to each agent; only MCP calls routed through this proxy are protected.
+Follow [`docs/SETUP.md`](docs/SETUP.md): prerequisites, Claude Code (verified) and Codex setup, an allowed and a blocked check, troubleshooting, and removal. To print the exact commands for your machine without writing anything:
+
+```bash
+node --import tsx src/config/client-setup.ts --config config/sandbox.yaml
+```
+
+Only MCP calls routed through this proxy are protected.
 
 ## What is protected, and what is not
 
