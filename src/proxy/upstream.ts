@@ -7,7 +7,9 @@
  *             "Sandbox"): no network, read-only root, all capabilities dropped, only
  *             the staging dir (rw) and optionally the server code (ro) mounted. Docker
  *             must be running and the image must exist locally, or this refuses to
- *             start. There is never a fallback to local mode. Containers are labeled
+ *             start. There is never a fallback to local mode. The docker CLI is found
+ *             on a PATH without node_modules/.bin or relative entries, and preflight
+ *             checks that it answers like Docker. Containers are labeled
  *             with the firewall's pid and host; before launching, containers left by
  *             a dead firewall on this host are removed (sweepOrphanedContainers).
  *
@@ -24,7 +26,7 @@ import { execFile as execFileCallback, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { realpathSync, statSync } from 'node:fs';
 import { hostname } from 'node:os';
-import { isAbsolute } from 'node:path';
+import { delimiter, isAbsolute } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Readable } from 'node:stream';
 import { promisify } from 'node:util';
@@ -280,13 +282,30 @@ function mountSource(dir: string, field: string): string {
   return real;
 }
 
-/** Environment for the docker CLI process itself: the safe default plus docker's own settings. */
+/**
+ * PATH used to find the docker CLI: `path` without node_modules/.bin entries (npm run and
+ * npx put them first, and the npm package named "docker" installs a `docker` bin there)
+ * and without empty or relative entries (they resolve against the current directory).
+ */
+export function dockerSearchPath(path: string | undefined): string {
+  return (path ?? '')
+    .split(delimiter)
+    .filter((entry) => isAbsolute(entry) && !/(^|[\\/])node_modules[\\/]\.bin[\\/]*$/i.test(entry))
+    .join(delimiter);
+}
+
+/**
+ * Environment for the docker CLI process itself: the safe default plus docker's own
+ * settings, with a filtered PATH. Every docker command (preflight, run, rm, the sweep)
+ * is spawned with it, and Node looks the command up on this env's PATH.
+ */
 function dockerCliEnv(): Record<string, string> {
   const env = getDefaultEnvironment();
   for (const key of DOCKER_CLI_ENV_VARS) {
     const value = process.env[key];
     if (value !== undefined) env[key] = value;
   }
+  env.PATH = dockerSearchPath(env.PATH ?? process.env.PATH);
   return env;
 }
 
@@ -302,14 +321,24 @@ const defaultExecFile: ExecFileFn = async (file, args, options) => {
   return { stdout, stderr };
 };
 
-/** Refuses to start unless Docker answers and the image exists locally. Never pulls. */
+/**
+ * Refuses to start unless Docker answers and the image exists locally. Never pulls.
+ * `docker version` must print Docker's version JSON with a server version: a program
+ * that merely exits 0 under the name docker does not pass.
+ */
 export async function preflightDocker(image: string, execFile: ExecFileFn = defaultExecFile): Promise<void> {
   const options = { timeout: DOCKER_CLI_TIMEOUT_MS, env: dockerCliEnv() };
+  let version: string;
   try {
-    await execFile('docker', ['version', '--format', '{{.Server.Version}}'], options);
+    ({ stdout: version } = await execFile('docker', ['version', '--format', '{{json .}}'], options));
   } catch (err) {
     throw new SandboxUnavailableError(
       `sandbox mode requires Docker, and ${dockerUnavailableReason(err)}; refusing to start`,
+    );
+  }
+  if (!hasServerVersion(version)) {
+    throw new SandboxUnavailableError(
+      'sandbox mode requires Docker, and the docker on PATH is not the Docker CLI (`docker version` did not report a server version); refusing to start',
     );
   }
   try {
@@ -570,6 +599,19 @@ function errorCode(err: unknown): string {
 }
 
 /** Why `docker version` failed: no CLI, or a CLI whose daemon did not answer (non-zero exit or timeout). */
+/** True if `stdout` is `docker version --format '{{json .}}'` output with a non-empty Server.Version. */
+function hasServerVersion(stdout: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return false;
+  }
+  const server = (parsed as { Server?: unknown } | null)?.Server;
+  const version = typeof server === 'object' && server !== null ? (server as { Version?: unknown }).Version : undefined;
+  return typeof version === 'string' && version.trim() !== '';
+}
+
 function dockerUnavailableReason(err: unknown): string {
   const code = errorCode(err);
   if (code === 'ENOENT') return 'docker CLI not found';

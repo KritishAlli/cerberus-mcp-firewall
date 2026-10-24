@@ -43,7 +43,7 @@ Now (on `aarav/wire-change-evaluator`):
 
 **Also found:**
 - Session taint is never wired: `index.ts` passes no `getSession`, so `SESSION_TAINTED` can't fire.
-- `d566d4e` added an unpinned, unused `"docker": "^1.0.0"` dependency (an npm doc generator) without the agreement cerberus §3 requires.
+- `d566d4e` added an unpinned, unused `"docker": "^1.0.0"` dependency (an npm doc generator) without the agreement cerberus §3 requires. **Removed on `aarav/fix-docker-shadowing`**, see Blockers.
 - ~~DECISIONS §12 described the rejected-changes note as appended~~: fixed to match `d11339a`.
 
 **Task 4.1.2 (client adapter):** recommendation in the audit doc and [DECISIONS §15](docs/DECISIONS.md) (proposed, pending team review): a Block-only, informational notice sent as MCP form elicitation after the DENY is final.
@@ -164,11 +164,15 @@ From `src/proxy/interceptor.ts`:
 ## Blockers
 
 - ~~Docker is not installed on Aarav's machine~~: installed; integration tests verified (see above).
-
-
+- ~~**A fake `docker` passed preflight on a fresh clone**~~ (found 2026-10-24, fixed on `aarav/fix-docker-shadowing`). The `docker@1.0.0` npm package from `d566d4e` (a docco doc generator) installs `node_modules/.bin/docker`. `npm run` and `npx` put `node_modules/.bin` first on PATH, so under `npm test`, `npm run test:docker` and `npm start` every docker command the firewall ran was the doc generator. It exits 0 for anything, so `docker version` and `docker image inspect` "passed" preflight and `docker run` started no container. Startup still failed closed (connect timeout, no local fallback), but a fresh clone failed 3 tests and sandbox-mode `npm start`. Aarav's checkout never installed the package, so it passed there. All 27 `npm audit` findings came from its dependency tree. Fixed:
+  - `npm uninstall docker` (`package.json` and lockfile; 137 packages removed, no other version changed; nothing imported it).
+  - `src/proxy/upstream.ts` finds the docker CLI on a PATH without `node_modules/.bin` or relative entries (`dockerSearchPath`), for preflight, `run`, `rm` and the orphan sweep alike.
+  - Preflight runs `docker version --format '{{json .}}'` and requires a non-empty `Server.Version`; otherwise `SandboxUnavailableError`: "the docker on PATH is not the Docker CLI". Still no shell, no pull, no local fallback. See [DECISIONS §17](docs/DECISIONS.md).
+  - Tests: a fake `docker` in a temp `node_modules/.bin` on PATH is never run (even one printing valid version JSON); a fake that exits 0 with junk fails preflight and is called once, for `version` only; six junk-output cases; every docker command's PATH is filtered. Each test was checked to fail with its half of the fix removed.
+  - **Removed:** `doc/doc-filelist.js`, `doc/doc-script.js`, `doc/doc-style.css`, also added in `d566d4e`. They were that generator's output (default `--output_dir ./doc`; `doc-script.js` was its `res/script.js` verbatim; a run regenerated them byte for byte), and nothing referenced them.
 - ~~`src/security/evaluator.ts` is the deny-all stub~~: Winston's real evaluator landed on `main` in PR #4 (`40ea8e4`). With the shipped policy it returns ALLOW / PROTECTED_PATH / DENIED_DESTINATION / DENIED_TOOL for the four demo calls, consistent with design §7.
 - ~~`demo/mock-server.ts` is a stub~~: landed in PR #3 (`6a7f51d`).
-- **Release gate (§10): all four commands pass** on this machine: `npm run typecheck`, `npm test` (261 passed), `npm run test:docker` with Docker running (36 passed; fails if Docker or `node:22-slim` is missing) and `npm run demo`.
+- **Release gate (§10): verified on a fresh clone** of `aarav/fix-docker-shadowing` (2026-10-24), not just this machine's checkout: `npm ci`, `npm audit` (0 vulnerabilities), `npm run typecheck`, `npm test` (274 passed), `npm run test:docker` (46 passed; fails if Docker or `node:22-slim` is missing), `npm run demo`, and sandbox mode started with `npm start -- --config config/sandbox.yaml` plus the sandbox check (allowed `src/greet.js` edit lands; `.husky/pre-commit` and a `package.json` `postinstall` rejected with `PERSISTENCE_PATH`; no container or staging dir left). Machine prerequisites no npm step provides: Docker running, `docker pull node:22-slim` (Docker tests) and `npm run sandbox:build` (sandbox mode).
 - **Open policy issues for Winston** (found in a read-only review; no proxy change needed):
   - case-variant protected paths are allowed on macOS
   - relative-path traversal is not resolved
@@ -233,5 +237,5 @@ Not changed in `src/shared/contracts.ts`; each needs Aarav, Winston and Kritish 
    3. ~~Orphan sweep, `--pull=never`, async `publish`; container removed before the client closes; `--memory-swap` = `--memory`; `onFileChangeEvent` thenable observed~~: done.
    4. **Blocked on Winston:** wire `getSession` or drop the unused taint input (Aarav does the wiring).
    5. **Blocked on the team:** agree on DECISIONS §15 and the `BlockNotice` shape. Aarav then runs the Claude Code 2.1.310 elicitation spike (declared capability on our `2025-11-25` connection, Esc and no-answer behavior, cancel on timeout) before implementing.
-   6. Team: review the `docker` npm dependency added in `d566d4e`.
+   6. ~~Team: review the `docker` npm dependency added in `d566d4e`~~: removed (it shadowed the Docker CLI; see Blockers), along with its generated `doc/` output.
 8. Optional, after acceptance tests: forward `list_changed`. Consider logging a clearer warning when the monitor port is taken, e.g. "events from this instance will not appear in the browser", and logging only the error code instead of the full `EADDRINUSE` object and stack.

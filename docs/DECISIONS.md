@@ -216,3 +216,12 @@ Proposal: when a call is denied and the agent's client declares the form elicita
 - **`onFileChangeEvent` is treated like `publish` (§5).** Its type is `=> void`, which an async function satisfies. A returned thenable is observed, not awaited: a rejection is logged with error class and code only, and never delays or changes the result.
 - **`src/index.ts` injects `evaluateFileChanges` explicitly**, so the runtime evaluator is visible at the composition root.
 - **Fallback default:** since PR #24 removed the reject-all stub, `defaultEvaluateFileChanges` is that same `src/security/changes.ts` evaluator, used only when `StagingDeps` has none (tests); with no `policy.staging` it denies every change, so the fallback still fails closed.
+
+## 17. The docker CLI is found on a filtered PATH and must prove it is Docker
+
+`npm run` and `npx` put `node_modules/.bin` first on PATH, so any dependency that ships a bin named `docker` replaces the Docker CLI for every firewall started that way. This happened: the `docker` npm package (a doc generator) exited 0 for every command, so preflight passed on its exit codes alone, and `docker run` started no container. Startup still failed closed, but only by timing out, and a third-party package ran where the sandbox check should have.
+
+- **Filtered PATH.** Every docker command (preflight, `run`, `rm`, the orphan sweep, the synchronous `rm` on exit) is spawned with `dockerCliEnv()`, whose PATH drops `node_modules/.bin` entries and empty or relative ones (those resolve against the current directory). Node looks the command up on the PATH in the env it is given, so this is the PATH that decides which `docker` runs. Nothing goes through a shell. An absolute directory the user put on PATH is still trusted: that is the user's choice, not a dependency's.
+- **Verified preflight.** `docker version --format '{{json .}}'` must exit 0 *and* print JSON with a non-empty `Server.Version`. Exit codes alone prove nothing. A missing CLI, a stopped daemon (non-zero exit) and a timeout keep their existing messages; anything else that exits 0 is refused with "the docker on PATH is not the Docker CLI". Images are still never pulled and there is still no local fallback.
+- **Not done:** a configurable absolute path to the docker binary. It adds a config key that every teammate's file would need, and the two checks above cover the failure we saw. If a stronger guarantee is wanted, that is the next step.
+
