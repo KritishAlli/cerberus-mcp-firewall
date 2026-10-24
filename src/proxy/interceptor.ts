@@ -5,7 +5,8 @@
  *   1. validate name + argument shape, clone + deep-freeze the arguments → ToolCallContext
  *   2. decision = deps.evaluate(ctx, deps.policy), validated with PolicyDecisionSchema
  *        - throws or returns garbage → DENY / EVALUATION_ERROR (fail closed)
- *   3. publish exactly one FirewallEvent (validated, inside try/catch; never changes the decision)
+ *   3. publish exactly one FirewallEvent (validated; a throw or a rejected promise is only logged;
+ *      never changes the decision)
  *   4. ALLOW → return await deps.forward(...) unchanged (the only forward call site)
  *      anything else → BLOCKED tool error; forward is NOT called
  *   5. forward throws → DOWNSTREAM ERROR tool error with a fixed message, never an implicit ALLOW
@@ -250,10 +251,31 @@ function publishSafely(
     log(`[firewall] request ${sanitize(requestId)} event failed validation; not published`);
     return;
   }
+  const failed = (err: unknown): void => {
+    try {
+      log(`[firewall] request ${sanitize(requestId)} publish failed: ${describeError(err)}`);
+    } catch {
+      // Diagnostics must not affect the result either.
+    }
+  };
+  let returned: unknown;
   try {
-    publish(parsed.data);
+    returned = publish(parsed.data);
   } catch (err) {
-    log(`[firewall] request ${sanitize(requestId)} publish failed: ${describeError(err)}`);
+    failed(err);
+    return;
+  }
+  // PublishEvent is typed `=> void`, which an async function also satisfies. Observe a
+  // returned thenable so its rejection is logged, never left unhandled. It is not awaited:
+  // the decision is already made and the result must not wait on observability.
+  try {
+    if ((typeof returned === 'object' && returned !== null) || typeof returned === 'function') {
+      if (typeof (returned as { then?: unknown }).then === 'function') {
+        Promise.resolve(returned as PromiseLike<unknown>).then(undefined, failed);
+      }
+    }
+  } catch (err) {
+    failed(err);
   }
 }
 

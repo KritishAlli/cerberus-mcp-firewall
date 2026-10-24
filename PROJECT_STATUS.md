@@ -2,12 +2,52 @@
 
 Merged to `main` (PRs #2, #7, #9, #10, #11, #12, #16). In progress on `aarav/docker-fixes`: fixes from the first Docker run (not yet merged). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
+## Cerberus 4.1 audit (2026-10-24, at `b0aaa7d`)
+
+Full report: [`docs/cerberus-proxy-audit.md`](docs/cerberus-proxy-audit.md). The audit changed no behavior; the follow-up the same day fixed 1c, 1e and 1f and restored the deleted suites (below). New: `tests/proxy-audit.test.ts` and `tests/fixtures/audit-stdio-server.mjs`.
+
+| Item | Verdict |
+| --- | --- |
+| 1a No forward on DENY | Pass |
+| 1b Fail closed | Pass (an apply failure can leave earlier *approved* changes applied, named in the result) |
+| 1c Publish can't change the decision | Pass. **Fixed:** a promise returned by `publish` is observed; its rejection is logged (class and code only) and never unhandled. |
+| 1d Docker preflight, no local fallback | Pass |
+| 1e Docker flags | Pass. **Fixed:** `docker run --pull=never`. Still open: swap is 2× memory. |
+| 1f Container cleanup | Pass. **Fixed:** containers are labeled (`mcp-firewall=1`, `.pid`, `.host`, `.staging`), and before each launch `sweepOrphanedContainers` removes only those of dead firewalls on this host. Live instances' and unlabeled containers are never touched; the sweep never throws or blocks startup. Still open: with a server that ignores stdin EOF, graceful shutdown hits the 2 s cap before `staging.dispose()` (the dir is swept on the next start). |
+| 1g Staged-call integration | Mechanism passes (lock, diff after error/timeout, apply/revert, WRITE_CONFLICT). **The runtime uses the reject-all stub:** `src/security` has no `evaluateFileChanges` and `src/index.ts` injects none, so `policy.staging` enforces nothing. |
+
+**Test suite:** `fe9db11` (Winston's branch) deleted the previous suite (2,653 lines). Aarav's suites are restored from `fa72e8e`, the newest copies on main. The `fe9db11^` copies were older, from before PRs #11–#18.
+
+| File | Lines |
+| --- | --- |
+| `tests/proxy.test.ts` | 1,748 |
+| `tests/staging.test.ts` | 432 |
+| `tests/upstream-docker.test.ts` | 370 |
+| `tests/fixtures/counting-server.ts` | 89 |
+| `tests/fixtures/docker-server.mjs` | 48 |
+
+- **Same edits as `6893078`:** the required policy fields and the session-taint unit test, applied again.
+- **Four stale assertions updated** to the current behavior, just as strictly: the counts now include `writesBlocked` (`f4dd9a2`); the rejection note comes first and `isError` is set (`d11339a`, two tests); `/health` includes `instance` (`76c88f1`).
+- **Not restored:** the monitor, events, contracts, security and e2e suites are other owners'. The counts further down describe the pre-`fe9db11` suite and are historical.
+
+Now:
+- `npm run typecheck`: passes.
+- `npm test`: 5 files, 191 passed, 1 expected-fail (`GAP 1g`).
+- `npm run test:docker`: 36 passed with Docker 29.9.2. That includes real-container tests for `--pull=never` and the orphan sweep: SIGKILL one firewall, start a new one, the orphan is removed and a live instance's container survives.
+
+**Also found:**
+- Session taint is never wired: `index.ts` passes no `getSession`, so `SESSION_TAINTED` can't fire.
+- `d566d4e` added an unpinned, unused `"docker": "^1.0.0"` dependency (an npm doc generator) without the agreement cerberus §3 requires.
+- ~~DECISIONS §12 described the rejected-changes note as appended~~: fixed to match `d11339a`.
+
+**Task 4.1.2 (client adapter):** recommendation in the audit doc and [DECISIONS §15](docs/DECISIONS.md) (proposed, pending team review): a Block-only, informational notice sent as MCP form elicitation after the DENY is final.
+
 ## Done
 
 - **`src/proxy/interceptor.ts`**: `createInterceptor(deps)` does validate → clone + deep-freeze → evaluate (schema-checked, fail closed) → publish exactly one event → forward only on ALLOW. It returns a recognizable BLOCKED tool error on DENY and a fixed-message DOWNSTREAM ERROR when the downstream fails.
   - **Staged writes** (on `aarav/interceptor-staging`): the optional `staging` dep `{ area, lock, evaluateFileChanges?, policy, onFileChangeEvent? }` sends every ALLOWed call through `runStagedCall` in the new **`src/proxy/staged-call.ts`**. Without it, behavior is unchanged and every earlier test passes as before.
   - Per call, under the `StagingLock`: a catch-up diff for late writes (reported as `<late-writes>`, request `<id>:late`), then sync, forward, and a diff that runs even after an error or timeout. Then `evaluateFileChanges` (output validated; if it throws or the output is malformed, every change is DENY / `EVALUATION_ERROR`), apply, revert of rejected changes, and a sync that sets the next baseline.
-  - The result keeps the downstream content and gets `_meta['mcp-firewall/staged'] = { applied, rejected, changes, truncated? }`. `changes` is capped at 100 and the totals stay exact. If anything was rejected, a note listing up to 100 rejected paths and rule IDs is appended (`REJECTED_CHANGES_PREFIX`). A `FileChangeEvent` is emitted only when there were changes: at most 20 entries, bounded paths, no `text`, and callback errors are only logged.
+  - The result keeps the downstream content and gets `_meta['mcp-firewall/staged'] = { applied, rejected, changes, truncated? }`. `changes` is capped at 100 and the totals stay exact. If anything was rejected (since `d11339a`), the result is `isError: true`. A note listing rejected paths with rule IDs and applied paths (each capped at 100) comes first (`REJECTED_CHANGES_PREFIX`). The server's first text block is prefixed as sandboxed output, and `structuredContent` is dropped. A `FileChangeEvent` is emitted only when there were changes: at most 20 entries, bounded paths, no `text`, and callback errors are only logged.
   - **Excluded paths** (`.git/`, `node_modules/`, `.env`…): server writes there are now reported, evaluated, forced to DENY if the evaluator allows them, never applied, and removed from staging. The excluded scan stops after `maxChangesPerCall + 1` entries (new `maxChangesPerCall` option on `createStagingArea`, default 1000). Excluded entries are not hashed, and `text` is read only up to `maxFileBytes`.
   - **Unsafe file names** (backslash, control characters, invalid UTF-8, a drive prefix at the root): scans read raw byte names. Such entries are reported as `special` under an escaped display path (`%XX`), forced to DENY, never applied, and deleted by their raw name in `revert()`. Staging breaks only if that deletion fails. Project files with unsafe names are not mirrored, like excluded paths.
   - **Baseline without a closing sync:** `StagingArea.baselineAfter()` records the expected post-call staging state, so a write landing after the post-call diff is caught by the next catch-up instead of being overwritten.
@@ -180,4 +220,11 @@ Not changed in `src/shared/contracts.ts`; each needs Aarav, Winston and Kritish 
 
         Then pass `staging` to `createInterceptor` (with `onFileChangeEvent` wired to the monitor, Kritish), and call `area.dispose()` on shutdown.
    - Swap the reject-all stub for Winston's `evaluateFileChanges` once `src/security/changes.ts` lands.
-7. Optional, after acceptance tests: forward `list_changed`. Consider logging a clearer warning when the monitor port is taken, e.g. "events from this instance will not appear in the browser", and logging only the error code instead of the full `EADDRINUSE` object and stack.
+7. **From the Cerberus 4.1 audit (2026-10-24)**, in order:
+   1. ~~Restore the deleted suite; fix `npm run test:docker`~~: done for Aarav's suites. Other owners: decide on the monitor, events, contracts, security and e2e suites.
+   2. **Blocked on Winston:** land `evaluateFileChanges` in `src/security`. Aarav then injects it in `src/index.ts` and turns `GAP 1g` into a plain test.
+   3. ~~Orphan sweep, `--pull=never`, async `publish`~~: done. Still open (Aarav): remove the container before closing the client so a server that ignores EOF can't push shutdown past the 2 s cap; consider `--memory-swap` equal to `--memory`; observe a thenable from `onFileChangeEvent` like `publish`.
+   4. **Blocked on Winston:** wire `getSession` or drop the unused taint input (Aarav does the wiring).
+   5. **Blocked on the team:** agree on DECISIONS §15 and the `BlockNotice` shape. Aarav then runs the Claude Code 2.1.310 elicitation spike (declared capability on our `2025-11-25` connection, Esc and no-answer behavior, cancel on timeout) before implementing.
+   6. Team: review the `docker` npm dependency added in `d566d4e`.
+8. Optional, after acceptance tests: forward `list_changed`. Consider logging a clearer warning when the monitor port is taken, e.g. "events from this instance will not appear in the browser", and logging only the error code instead of the full `EADDRINUSE` object and stack.
