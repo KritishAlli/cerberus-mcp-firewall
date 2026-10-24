@@ -2,8 +2,8 @@
  * OWNER: Kritish — event bus, counters and redaction (design doc §8, T11).
  */
 import { describe, expect, it } from 'vitest';
-import { createEventBus, redactText, REDACTED } from '../src/observability/events.js';
-import type { FirewallEvent } from '../src/shared/contracts.js';
+import { createEventBus, describeFileChanges, redactText, REDACTED } from '../src/observability/events.js';
+import type { FileChangeEvent, FirewallEvent } from '../src/shared/contracts.js';
 
 const MOCK_SECRET = 'AKIA-DUMMY-DO-NOT-USE-0000000000';
 const FIXTURE_SECRET = 'DUMMY-SECRET-DO-NOT-LEAK';
@@ -20,6 +20,24 @@ function event(overrides: Partial<FirewallEvent> = {}): FirewallEvent {
     ruleId: 'APPROVED_TOOL',
     reason: 'Tool is on the approved list',
     summary: 'read_project_file args=[path] → ALLOW APPROVED_TOOL',
+    ...overrides,
+  };
+}
+
+function fileChanges(overrides: Partial<FileChangeEvent> = {}): FileChangeEvent {
+  seq += 1;
+  return {
+    timestamp: new Date().toISOString(),
+    requestId: `req-${seq}`,
+    serverId: 'demo',
+    toolName: 'write_file',
+    applied: 2,
+    rejected: 1,
+    changes: [
+      { path: 'src/greet.js', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' },
+      { path: 'src/index.js', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' },
+      { path: 'package.json', decision: 'DENY', ruleId: 'PERSISTENCE_PATH' },
+    ],
     ...overrides,
   };
 }
@@ -147,5 +165,100 @@ describe('redaction (T11)', () => {
     const [stored] = bus.recent();
     expect(stored?.summary.length).toBeLessThanOrEqual(200);
     expect(stored?.summary).not.toMatch(/password=x\b/);
+  });
+});
+
+describe('file-change events', () => {
+  it('formats counts and rejected paths with their rule IDs', () => {
+    expect(describeFileChanges(fileChanges())).toBe('2 applied, 1 rejected: package.json PERSISTENCE_PATH');
+  });
+
+  it('formats an all-applied diff without a path list', () => {
+    const e = fileChanges({
+      applied: 1,
+      rejected: 0,
+      changes: [{ path: 'src/greet.js', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' }],
+    });
+    expect(describeFileChanges(e)).toBe('1 applied, 0 rejected');
+  });
+
+  it('says how many rejections were not listed', () => {
+    const e = fileChanges({
+      applied: 0,
+      rejected: 3,
+      changes: [
+        { path: '.git/hooks/pre-commit', decision: 'DENY', ruleId: 'PERSISTENCE_PATH' },
+        { path: 'run.sh', decision: 'DENY', ruleId: 'EXECUTABLE_DENIED' },
+      ],
+    });
+    expect(describeFileChanges(e)).toBe(
+      '0 applied, 3 rejected: .git/hooks/pre-commit PERSISTENCE_PATH, run.sh EXECUTABLE_DENIED, +1 more',
+    );
+  });
+
+  it('keeps its own ring and subscribers, and leaves call counters alone', () => {
+    const { bus } = quietBus(2);
+    const seen: string[] = [];
+    const unsubscribe = bus.subscribeFileChanges((e) => seen.push(e.requestId));
+    const sent = [fileChanges(), fileChanges(), fileChanges()];
+    for (const e of sent) bus.publishFileChanges(e);
+    unsubscribe();
+    bus.publishFileChanges(fileChanges());
+
+    expect(seen).toEqual(sent.map((e) => e.requestId));
+    expect(bus.recentFileChanges().map((e) => e.requestId)).toHaveLength(2);
+    expect(bus.recent()).toEqual([]);
+    expect(bus.counts()).toEqual({ inspected: 0, allowed: 0, denied: 0 });
+    bus.setMaxEvents(1);
+    expect(bus.recentFileChanges()).toHaveLength(1);
+  });
+
+  it('drops malformed events and events whose entries outnumber the totals', () => {
+    const { bus, logs } = quietBus();
+    bus.publishFileChanges({ nonsense: true } as unknown as FileChangeEvent);
+    // A contents field is not part of the contract, so strict parsing rejects it.
+    bus.publishFileChanges({ ...fileChanges(), text: 'file body' } as unknown as FileChangeEvent);
+    bus.publishFileChanges(fileChanges({ rejected: 0 }));
+    bus.publishFileChanges(fileChanges({ applied: 1 }));
+    expect(bus.recentFileChanges()).toEqual([]);
+    expect(logs.filter((l) => l === '[firewall] dropped malformed file-change event')).toHaveLength(4);
+  });
+
+  it('redacts secrets in paths and keeps them within the path limit', () => {
+    const { bus, logs } = quietBus();
+    const streamed: FileChangeEvent[] = [];
+    bus.subscribeFileChanges((e) => streamed.push(e));
+    bus.publishFileChanges(
+      fileChanges({
+        applied: 0,
+        rejected: 2,
+        changes: [
+          { path: `notes/${MOCK_SECRET}.txt`, decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' },
+          // 196 chars, but redaction lengthens it past the 200-char path limit.
+          { path: `${'a/'.repeat(93)}password=x`, decision: 'DENY', ruleId: 'WRITE_NOT_ALLOWED' },
+        ],
+      }),
+    );
+    const output = JSON.stringify([bus.recentFileChanges(), streamed, logs]);
+    expect(output).not.toContain(MOCK_SECRET);
+    expect(output).not.toMatch(/password=x\b/);
+    for (const c of bus.recentFileChanges()[0]!.changes) expect(c.path.length).toBeLessThanOrEqual(200);
+  });
+
+  it('never throws, and stored events are frozen', () => {
+    const bus = createEventBus({
+      log: () => {
+        throw new Error('log down');
+      },
+    });
+    bus.subscribeFileChanges(() => {
+      throw new Error('subscriber down');
+    });
+    expect(() => bus.publishFileChanges(fileChanges())).not.toThrow();
+    expect(() => bus.publishFileChanges(null as unknown as FileChangeEvent)).not.toThrow();
+    const [stored] = bus.recentFileChanges();
+    expect(Object.isFrozen(stored)).toBe(true);
+    expect(Object.isFrozen(stored!.changes)).toBe(true);
+    expect(Object.isFrozen(stored!.changes[0])).toBe(true);
   });
 });

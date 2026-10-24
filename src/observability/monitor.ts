@@ -2,7 +2,9 @@
  * OWNER: Kritish — localhost HTTP + SSE monitor (design doc §8).
  *
  *   GET /         → serves ./index.html (read-only UI)
- *   GET /events   → Server-Sent Events: the buffered recent events first, then live ones
+ *   GET /events   → Server-Sent Events: the buffered recent events first, then live ones.
+ *                   `firewall` frames carry FirewallEvents; `filechanges` frames carry
+ *                   FileChangeEvents plus a ready-made `line` (paths and rule IDs, never contents).
  *   GET /health   → { status, protectedServers } from live upstream state
  *
  * Binds to config.host (127.0.0.1 only) and rejects requests whose Host header is
@@ -15,8 +17,8 @@ import { resolve } from 'node:path';
 import { serve, type ServerType } from '@hono/node-server';
 import { Hono } from 'hono';
 import { streamSSE, type SSEStreamingApi } from 'hono/streaming';
-import type { FirewallEvent, MonitorConfig } from '../shared/contracts.js';
-import { eventBus, type EventBus } from './events.js';
+import type { FileChangeEvent, FirewallEvent, MonitorConfig } from '../shared/contracts.js';
+import { describeFileChanges, eventBus, type EventBus } from './events.js';
 
 /** Upper bound on simultaneous SSE clients; the monitor is for one person's browser. */
 const MAX_SSE_CLIENTS = 16;
@@ -94,21 +96,38 @@ export async function startMonitor(config: MonitorConfig, options: MonitorOption
         pending += 1;
         chain = chain.then(write).catch(() => stream.abort()).finally(() => (pending -= 1));
       };
-      const sendEvent = (event: FirewallEvent): void => {
+      const writeFirewall = (event: FirewallEvent): void =>
         send(() => stream.writeSSE({ event: 'firewall', id: event.requestId, data: JSON.stringify(event) }));
+      const writeFileChanges = (event: FileChangeEvent): void =>
+        send(() =>
+          stream.writeSSE({
+            event: 'filechanges',
+            id: event.requestId,
+            data: JSON.stringify({ ...event, line: describeFileChanges(event) }),
+          }),
+        );
+      const sendEvent = (event: FirewallEvent): void => {
+        writeFirewall(event);
         send(() => stream.writeSSE({ event: 'counts', data: JSON.stringify(bus.counts()) }));
       };
 
       // Snapshot and subscribe in the same tick: publish is synchronous, so nothing
       // can land between them, and nothing is sent twice.
       const backlog = bus.recent();
+      const fileBacklog = bus.recentFileChanges();
       const unsubscribe = bus.subscribe(sendEvent);
+      const unsubscribeFiles = bus.subscribeFileChanges(writeFileChanges);
 
       send(() => stream.writeSSE({ event: 'counts', data: JSON.stringify(bus.counts()) }));
-      for (const event of backlog) {
-        send(() => stream.writeSSE({ event: 'firewall', id: event.requestId, data: JSON.stringify(event) }));
-      }
-      send(() => stream.writeSSE({ event: 'ready', data: JSON.stringify({ replayed: backlog.length }) }));
+      // Call events first, so the page can attach each file-change line to its call's row.
+      for (const event of backlog) writeFirewall(event);
+      for (const event of fileBacklog) writeFileChanges(event);
+      send(() =>
+        stream.writeSSE({
+          event: 'ready',
+          data: JSON.stringify({ replayed: backlog.length, replayedFileChanges: fileBacklog.length }),
+        }),
+      );
 
       const keepalive = setInterval(() => send(() => stream.write(': keepalive\n\n').then(() => {})), KEEPALIVE_MS);
       try {
@@ -116,6 +135,7 @@ export async function startMonitor(config: MonitorConfig, options: MonitorOption
       } finally {
         clearInterval(keepalive);
         unsubscribe();
+        unsubscribeFiles();
         streams.delete(stream);
       }
     });
