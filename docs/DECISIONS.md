@@ -91,3 +91,16 @@ The registered command is `<repo>/node_modules/.bin/tsx <repo>/src/index.ts --co
 - `<repo>/node_modules/.bin/tsx` is the version from `package-lock.json`, installed by `npm ci`. It gives the same result from any working directory and needs no network.
 - A relative `src/index.ts`, or a relative `--config`, would also resolve against the session's working directory. `src/index.ts` calls `resolve(values.config)`, so the config path must be absolute too. Paths *inside* the config (`server.cwd`) are resolved relative to the config file by the loader, and the default config is found via `import.meta.url`.
 - Registration scope is separate from path resolution. `--scope local` stores the server for the folder `claude mcp add` was run in, so it only appears in sessions started there. Absolute paths make the command correct in *any* scope.
+
+## 9. Staged writes: sandboxed downstream, diff after each call, apply only approved changes
+
+Decision (contract on `contract/staged-writes`): in sandbox mode the downstream server runs in a Docker container against a **staging copy** of the project, not the project itself. After every allowed call the proxy diffs the staging copy against the project, runs each change through `EvaluateFileChanges`, and applies only the approved ones. Denied changes are discarded and reported in one `FileChangeEvent` (paths and rule IDs only, never contents).
+
+Why: argument screening (§3, §4) only sees what the agent *asked* for. A malicious or compromised server can ignore its arguments and write anywhere it can reach: shell rc files, git hooks, CI config, new executables, files with secrets in them. Nothing in a `tools/call` reveals that. Checking the resulting changes, instead of the request, catches writes the arguments never mentioned.
+
+Tradeoffs:
+
+- **Docker shares the host kernel.** The container is a strong boundary against ordinary file writes, not against a kernel or container-runtime exploit.
+- **Network tools don't work in sandbox mode.** The container runs with no network (`--network none`), so a server that needs to fetch or send data can't be sandboxed this way.
+- **Small projects only.** Copying and diffing the whole project on every call is slow and disk-heavy for large trees. `staging.maxFileBytes` and `staging.maxChangesPerCall` bound the work per call, not the project size.
+- `policy.staging` is optional in the schema so existing configs keep loading, but sandbox mode refuses to start without it. A missing section never means "allow all writes".
