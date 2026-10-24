@@ -1,6 +1,6 @@
 # Project status: proxy and enforcement (Aarav)
 
-Merged to `main` (PRs #2, #7, #9, #10, #11, #12, #16, #17, #23). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
+Merged to `main` (PRs #2, #7, #9, #10, #11, #12, #16, #17, #23; Kritish's #24 touches staging). Rationale for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ## Cerberus 4.1 audit (2026-10-24, at `b0aaa7d`)
 
@@ -60,7 +60,7 @@ Now (on `aarav/wire-change-evaluator`):
   - **Fail closed:** any sync/diff/apply/revert error returns a `STAGING_ERROR_PREFIX` tool error (naming paths already applied, via the new `StagingApplyError` in `staging.ts`) and breaks staging. Every later allowed call is refused without forwarding until restart, and so are calls before `initStaging()` has run.
   - `initStaging(staging, { serverId, initial })` reverts changes the server made before any call, emits a `<startup>` event (WRITE_NOT_ALLOWED, "change made before any tool call"), and throws if staging fails.
   - The interceptor branches on `decision` only. See [DECISIONS §12](docs/DECISIONS.md).
-  - **Change evaluator:** `src/index.ts` injects Winston's `evaluateFileChanges` from `src/security/changes.ts`. Without an injected one (tests only), the default is still the reject-all stub `src/proxy/stubs/evaluate-file-changes.stub.ts`.
+  - **Change evaluator:** `src/index.ts` injects Winston's `evaluateFileChanges` from `src/security/changes.ts`. PR #24 (Kritish) deleted the reject-all stub `src/proxy/stubs/evaluate-file-changes.stub.ts`; the fallback `defaultEvaluateFileChanges`, used only when none is injected (tests), is now the same evaluator ([DECISIONS §16](docs/DECISIONS.md)).
 - **`src/proxy/upstream.ts`**: `connectUpstream(config, { onClose? })` spawns the server over stdio with a safe default env and re-emits its stderr with a prefix. It has a connect timeout, per-call `timeout`/`maxTotalTimeout`/`signal`, paginated `listTools` (20-page cap), a `connected` getter, and `UpstreamUnavailableError` once closed. No reconnect.
   - **Docker launch mode**: `connectUpstream(server, { launch })` takes an exported, Zod-validated `UpstreamLaunch`. It is either `{ mode: 'local', command, args, env?, cwd? }` (the old behavior, built by `localLaunch(server)`) or `{ mode: 'docker', image, command, args, workspaceDir, serverDir?, env?, user?, memory?, pidsLimit? }`.
   - Docker mode runs the plan's locked-down container: `--network none --read-only --cap-drop ALL --security-opt no-new-privileges`, host `uid:gid`, pids 128, 512m with `--memory-swap` equal (no swap), tmpfs `/tmp`, staging rw at `/workspace`, server code ro at `/server`, and only explicit `-e` vars. `buildDockerArgs(launch)` builds the argv. It is exported, unit-tested and never uses a shell.
@@ -78,6 +78,7 @@ Now (on `aarav/wire-change-evaluator`):
   - `diff(before)`: rescans staging and returns `FileChange[]` (add / modify / delete / mode / symlink / special), sorted by path. `text` is set only for UTF-8 files without NUL of at most `maxFileBytes`.
   - `apply(changes, decisions, projectAtSync)`: writes ALLOWed changes via temp file + rename. It skips a path with WRITE_CONFLICT if the project changed since sync. Symlink and special changes and excluded paths are never applied. A staged file that changed after `diff()` aborts the apply before anything is written.
   - `revert(paths)`: restores those paths in staging from the project.
+  - **Move pairing** (PR #24, Kritish): in `apply()`, a delete whose content (sha256) reappears in an add or modify of the same batch is treated as a move's source. It runs after the writes and only if one of those destinations was applied; otherwise it is skipped with the destination's rule ID, so denying a move's destination (or a WRITE_CONFLICT on it) never loses the file. Covered by three new tests in `tests/staging.test.ts`.
 
   Also exported: `snapshot(root)`, `resolveInRoot(root, rel)` (the single path-safety check) and `StagingLock` (async mutex for the interceptor). Every error is thrown to the caller, with no paths or contents in messages. Node built-ins only. See [DECISIONS §10](docs/DECISIONS.md).
 - **`tests/fixtures/malicious-server.ts`**: test-only stdio server rooted at `--root`. Tools: `write_file`, `format_readme` (README edit plus a `.git` hook, a `.husky` hook, a symlink, an exec bit, a dummy AWS key and a deleted `LICENSE`), `late_write`, `write_many`, `flood_node_modules`, `write_unsafe_names`, `write_big_unreadable`, `noop`, `fail_after_write`, `hang`, `get_call_counts`. With `MALICIOUS_STARTUP=1` it writes a file before serving.
@@ -225,7 +226,7 @@ Not changed in `src/shared/contracts.ts`; each needs Aarav, Winston and Kritish 
         5. `await initStaging(staging, { serverId, initial })`
 
         Then pass `staging` to `createInterceptor` (with `onFileChangeEvent` wired to the monitor, Kritish), and call `area.dispose()` on shutdown.
-   - ~~Swap the reject-all stub for Winston's `evaluateFileChanges`~~: done on `aarav/wire-change-evaluator`.
+   - ~~Swap the reject-all stub for Winston's `evaluateFileChanges`~~: done on `aarav/wire-change-evaluator`; the stub itself was deleted in PR #24.
 7. **From the Cerberus 4.1 audit (2026-10-24)**, in order:
    1. ~~Restore the deleted suite; fix `npm run test:docker`~~: done for Aarav's suites. Other owners: decide on the monitor, events, contracts, security and e2e suites.
    2. ~~Inject `evaluateFileChanges` in `src/index.ts`; `GAP 1g` → plain test~~: done.

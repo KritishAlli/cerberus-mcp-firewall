@@ -38,6 +38,7 @@ import {
   type FirewallPolicy,
   type RuleId,
 } from '../shared/contracts.js';
+import { evaluateFileChanges } from '../security/changes.js';
 import {
   StagingApplyError,
   type ApplyResult,
@@ -46,7 +47,6 @@ import {
   type StagingLock,
   type SyncResult,
 } from './staging.js';
-import { evaluateFileChangesStub } from './stubs/evaluate-file-changes.stub.js';
 
 /** Key under CallToolResult._meta carrying the staged-writes outcome of the call. */
 export const STAGED_META_KEY = 'mcp-firewall/staged';
@@ -57,8 +57,8 @@ export const REJECTED_CHANGES_PREFIX = 'MCP Firewall: changes blocked.';
 /** Put before the server's first text block in such a result, so its own "success" text can't stand alone. */
 export const SERVER_OUTPUT_PREFIX = 'Server output (from the sandboxed copy; see firewall note above):';
 
-/** Used when no evaluateFileChanges is injected. src/index.ts injects src/security/changes.ts. */
-export const defaultEvaluateFileChanges: EvaluateFileChanges = evaluateFileChangesStub;
+/** Fallback when StagingDeps has no evaluateFileChanges (tests); src/index.ts injects it explicitly. */
+export const defaultEvaluateFileChanges: EvaluateFileChanges = evaluateFileChanges;
 
 const LATE_TOOL_NAME = '<late-writes>';
 const STARTUP_TOOL_NAME = '<startup>';
@@ -77,7 +77,7 @@ export interface StagingDeps {
   area: StagingAreaLike;
   /** Held from the catch-up diff to the end of post-call processing. */
   lock: StagingLock;
-  /** Default: defaultEvaluateFileChanges (reject-all). */
+  /** Default: defaultEvaluateFileChanges (src/security/changes.ts). */
   evaluateFileChanges?: EvaluateFileChanges;
   policy: FirewallPolicy;
   /**

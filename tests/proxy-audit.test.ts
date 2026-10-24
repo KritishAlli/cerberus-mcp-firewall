@@ -626,7 +626,7 @@ describe('1g staged-call integration', () => {
   const allowAll: EvaluateFileChanges = (changes) =>
     changes.map((c) => ({ path: c.path, decision: 'ALLOW', ruleId: 'APPROVED_TOOL', reason: 'test' }));
 
-  it('diffs and reverts after a downstream timeout; nothing reaches the project (reject-all default)', async () => {
+  it('diffs and reverts after a downstream timeout; nothing reaches the project (default evaluator, no staging policy)', async () => {
     const s = await stagedProject();
     const h = harness({
       staging: s.deps,

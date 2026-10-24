@@ -686,6 +686,11 @@ export class StagingArea {
    * `changes` one to one (same paths, same order), as EvaluateFileChanges
    * returns them. Each write or delete first re-checks the project path
    * against `projectAtSync` and skips it with WRITE_CONFLICT if it changed.
+   *
+   * A delete whose content reappears in an add or modify of the same batch is
+   * the source half of a move. It runs after the writes, and only if one of
+   * those writes was applied; otherwise it is skipped with that write's rule,
+   * so rejecting a move's destination never loses the file.
    */
   async apply(
     changes: readonly FileChange[],
@@ -697,8 +702,16 @@ export class StagingArea {
     if (decisions.length !== changes.length) throw new StagingError('one decision per change is required');
 
     const results: ApplyResult[] = [];
-    const deletes: { index: number; rel: string; abs: string }[] = [];
+    const deletes: { index: number; rel: string; abs: string; destinations?: number[] }[] = [];
     const writes: { index: number; rel: string; abs: string; content: Buffer; executable: boolean }[] = [];
+
+    // sha256 → indexes of the adds and modifies whose staged content has it, for pairing moves.
+    const byHash = new Map<string, number[]>();
+    for (const [index, change] of changes.entries()) {
+      if (change.kind !== 'add' && change.kind !== 'modify') continue;
+      const hash = after.get(change.path)?.sha256;
+      if (hash !== undefined) byHash.set(hash, [...(byHash.get(hash) ?? []), index]);
+    }
 
     // Phase 1: decide, and load approved content from staging. Nothing is written yet,
     // so a staged file that changed since diff() aborts the whole apply.
@@ -714,7 +727,9 @@ export class StagingArea {
       const staged = after.get(rel);
       if (change.kind === 'delete') {
         if (staged !== undefined && staged.type !== 'dir') throw new StagingError('change does not match the staged diff');
-        deletes.push({ index, rel, abs });
+        const hash = projectAtSync.get(rel)?.sha256;
+        const destinations = hash === undefined ? undefined : byHash.get(hash);
+        deletes.push({ index, rel, abs, ...(destinations ? { destinations } : {}) });
         continue;
       }
       if (staged?.type !== 'file') throw new StagingError('change does not match the staged diff');
@@ -726,21 +741,23 @@ export class StagingArea {
       writes.push({ index, rel, abs, content, executable: isExecutable(staged.mode) });
     }
 
-    // Phase 2: deletes deepest first (so a directory can become a file), then writes in path order.
-    // A failure here throws StagingApplyError naming what was already applied.
+    // Phase 2: deletes deepest first (so a directory can become a file), then writes in path order,
+    // then move sources. A failure here throws StagingApplyError naming what was already applied.
     const applied: string[] = [];
-    try {
-      for (const d of deletes.sort((a, b) => (a.rel < b.rel ? 1 : -1))) {
-        const blocked = await this.checkProjectPath(d.rel, d.abs, projectAtSync);
-        if (blocked) {
-          results[d.index] = { path: changes[d.index]!.path, applied: false, ruleId: blocked };
-          continue;
-        }
-        if (await lstatIfPresent(d.abs)) await unlink(d.abs);
-        applied.push(changes[d.index]!.path);
-        await this.pruneEmptyProjectDirs(d.rel, after);
-        results[d.index] = { path: changes[d.index]!.path, applied: true, ruleId: decisions[d.index]!.ruleId };
+    const runDelete = async (d: (typeof deletes)[number]): Promise<void> => {
+      const blocked = await this.checkProjectPath(d.rel, d.abs, projectAtSync);
+      if (blocked) {
+        results[d.index] = { path: changes[d.index]!.path, applied: false, ruleId: blocked };
+        return;
       }
+      if (await lstatIfPresent(d.abs)) await unlink(d.abs);
+      applied.push(changes[d.index]!.path);
+      await this.pruneEmptyProjectDirs(d.rel, after);
+      results[d.index] = { path: changes[d.index]!.path, applied: true, ruleId: decisions[d.index]!.ruleId };
+    };
+    deletes.sort((a, b) => (a.rel < b.rel ? 1 : -1));
+    try {
+      for (const d of deletes) if (!d.destinations) await runDelete(d);
       for (const w of writes.sort((a, b) => (a.rel < b.rel ? -1 : 1))) {
         const blocked = await this.checkProjectPath(w.rel, w.abs, projectAtSync);
         if (blocked) {
@@ -750,6 +767,15 @@ export class StagingArea {
         await this.writeProjectFile(w.abs, w.content, w.executable);
         applied.push(changes[w.index]!.path);
         results[w.index] = { path: changes[w.index]!.path, applied: true, ruleId: decisions[w.index]!.ruleId };
+      }
+      // Every add and modify has a result by now.
+      for (const d of deletes) {
+        if (!d.destinations) continue;
+        if (d.destinations.some((i) => results[i]!.applied)) {
+          await runDelete(d);
+        } else {
+          results[d.index] = { path: changes[d.index]!.path, applied: false, ruleId: results[d.destinations[0]!]!.ruleId };
+        }
       }
     } catch (err) {
       if (applied.length === 0) throw err;

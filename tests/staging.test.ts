@@ -234,6 +234,57 @@ describe('staging / apply', () => {
     expect(await readFile(join(area.projectRoot, 'b.txt'), 'utf8')).toBe('edited by user');
   });
 
+  it('keeps the source of a move whose destination is denied', async () => {
+    await put(area.projectRoot, 'src/index.js', 'main');
+    await put(area.projectRoot, 'src/other.js', 'other');
+    const { staging, project } = await area.sync();
+    await rm(join(area.stagingRoot, 'src/index.js'));
+    await rm(join(area.stagingRoot, 'src/other.js'));
+    await put(area.stagingRoot, 'notes.js', 'main');
+    const changes = await area.diff(staging);
+    const decisions = changes.map((c) => (c.path === 'notes.js' ? deny(c) : allow(c)));
+
+    expect(await area.apply(changes, decisions, project)).toEqual([
+      { path: 'notes.js', applied: false, ruleId: 'PERSISTENCE_PATH' },
+      { path: 'src/index.js', applied: false, ruleId: 'PERSISTENCE_PATH' },
+      // Unrelated content: an ordinary delete, applied.
+      { path: 'src/other.js', applied: true, ruleId: 'APPROVED_TOOL' },
+    ]);
+    expect(await readFile(join(area.projectRoot, 'src/index.js'), 'utf8')).toBe('main');
+    expect((await readdir(area.projectRoot, { recursive: true })).sort()).toEqual(['src', 'src/index.js']);
+  });
+
+  it('applies both halves of an allowed move', async () => {
+    await put(area.projectRoot, 'src/greet.js', 'greet');
+    const { staging, project } = await area.sync();
+    await rm(join(area.stagingRoot, 'src/greet.js'));
+    await put(area.stagingRoot, 'src/hello.js', 'greet');
+    const changes = await area.diff(staging);
+
+    expect(await area.apply(changes, changes.map(allow), project)).toEqual([
+      { path: 'src/greet.js', applied: true, ruleId: 'APPROVED_TOOL' },
+      { path: 'src/hello.js', applied: true, ruleId: 'APPROVED_TOOL' },
+    ]);
+    expect((await readdir(join(area.projectRoot, 'src'))).sort()).toEqual(['hello.js']);
+  });
+
+  it('keeps the source of a move whose destination hits WRITE_CONFLICT', async () => {
+    await put(area.projectRoot, 'a.txt', 'moved');
+    await put(area.projectRoot, 'b.txt', 'v1');
+    const { staging, project } = await area.sync();
+    await rm(join(area.stagingRoot, 'a.txt'));
+    await put(area.stagingRoot, 'b.txt', 'moved');
+    const changes = await area.diff(staging);
+
+    await put(area.projectRoot, 'b.txt', 'edited by user');
+    expect(await area.apply(changes, changes.map(allow), project)).toEqual([
+      { path: 'a.txt', applied: false, ruleId: 'WRITE_CONFLICT' },
+      { path: 'b.txt', applied: false, ruleId: 'WRITE_CONFLICT' },
+    ]);
+    expect(await readFile(join(area.projectRoot, 'a.txt'), 'utf8')).toBe('moved');
+    expect(await readFile(join(area.projectRoot, 'b.txt'), 'utf8')).toBe('edited by user');
+  });
+
   it('never applies symlink or special changes, even when ALLOWed', async () => {
     await put(area.projectRoot, 'a.txt', 'a');
     const { staging, project } = await area.sync();
