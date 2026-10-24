@@ -136,19 +136,32 @@
         document.getElementById('denied').textContent = counts.denied;
       }
 
+      // "Live" needs both: the event stream is open AND /health says a server is protected.
+      let streamOpen = false;
+      let health = null; // last /health body, or null if unreachable
+
+      function renderStatus() {
+        let ok = false;
+        let text;
+        if (!streamOpen) text = 'Disconnected, retrying…';
+        else if (!health) text = 'Firewall unreachable';
+        else if (health.status !== 'ok') text = 'No downstream server connected';
+        else {
+          ok = true;
+          const n = health.protectedServers;
+          text = 'Live · protecting ' + n + ' server' + (n === 1 ? '' : 's');
+        }
+        statusEl.className = ok ? 'ok' : 'bad';
+        statusEl.textContent = text;
+      }
+
       async function refreshHealth() {
         try {
-          const res = await fetch('/health');
-          const body = await res.json();
-          const ok = body.status === 'ok';
-          statusEl.className = ok ? 'ok' : 'bad';
-          statusEl.textContent = ok
-            ? 'Live · protecting ' + body.protectedServers + ' server' + (body.protectedServers === 1 ? '' : 's')
-            : 'No downstream server connected';
+          health = await (await fetch('/health')).json();
         } catch {
-          statusEl.className = 'bad';
-          statusEl.textContent = 'Firewall unreachable';
+          health = null;
         }
+        renderStatus();
       }
 
       const source = new EventSource('/events');
@@ -156,13 +169,14 @@
         // The server replays its buffer on every (re)connect, so start clean.
         feed.replaceChildren();
         empty.hidden = false;
+        streamOpen = true;
         refreshHealth();
       });
       source.addEventListener('firewall', (e) => addRow(JSON.parse(e.data)));
       source.addEventListener('counts', (e) => setCounts(JSON.parse(e.data)));
       source.addEventListener('error', () => {
-        statusEl.className = 'bad';
-        statusEl.textContent = 'Disconnected, retrying…';
+        streamOpen = false;
+        renderStatus();
       });
       setInterval(refreshHealth, 5000);
     </script>
