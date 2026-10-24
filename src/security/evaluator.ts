@@ -21,12 +21,12 @@ export const evaluateToolCall: EvaluateToolCall = (request, policy) => {
   const context = checkedRequest.data;
   const rules = [
     matchDeniedTool(context, checkedPolicy.data),
-    matchTaintedSession(context, checkedPolicy.data),
     matchProtectedPath(context, checkedPolicy.data),
     matchAllowedRoot(context, checkedPolicy.data),
     matchDeniedDestination(context, checkedPolicy.data),
     matchArgumentSecrets(context, checkedPolicy.data),
     matchDestructiveAction(context, checkedPolicy.data),
+    matchTaintedSession(context, checkedPolicy.data),
     matchApprovedTool(context, checkedPolicy.data),
   ];
   for (const result of rules) if (result) return result;

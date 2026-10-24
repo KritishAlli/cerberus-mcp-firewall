@@ -124,6 +124,16 @@ export function matchAllowedRoot(request: ToolCallContext, policy: FirewallPolic
   const { values, valid } = argumentStrings(request, policy);
   if (!valid) return deny('INVALID_ARGUMENTS', 'A configured path or destination argument must contain strings');
   for (const item of values) {
+    for (const ref of extractUrlReferences(item.value).filter((r) => r.value.toLowerCase().startsWith('file://'))) {
+      try {
+        const host = new URL(ref.value).hostname.toLowerCase();
+        if (host !== '' && host !== 'localhost') {
+          return deny('PATH_NOT_ALLOWED', 'Remote file URLs are outside the configured local roots');
+        }
+      } catch {
+        return deny('INVALID_ARGUMENTS', 'File URL is malformed');
+      }
+    }
     for (const candidate of pathCandidates(item)) {
       if (!pathWithinRoots(candidate, policy.allowedRoots)) {
         return deny('PATH_NOT_ALLOWED', 'Path is outside the configured allowed roots');
