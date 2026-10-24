@@ -27,6 +27,7 @@ import {
   type FirewallPolicy,
   type PolicyDecision,
   type PublishEvent,
+  type SessionContext,
   type ToolCallContext,
 } from '../shared/contracts.js';
 import { runStagedCall, type StagingDeps } from './staged-call.js';
@@ -65,6 +66,8 @@ export interface InterceptorDeps {
   newRequestId?: () => string;
   /** Clock in epoch milliseconds. Defaults to Date.now. */
   now?: () => number;
+  /** Current session taint state. If the provider fails, sensitive calls fail closed as tainted. */
+  getSession?: () => SessionContext;
   /** Staged writes for a sandboxed server. Without it, allowed calls are forwarded as before. */
   staging?: StagingDeps;
 }
@@ -98,7 +101,7 @@ export function createInterceptor(deps: InterceptorDeps): ToolCallHandler {
     const requestId = newRequestId();
     const displayName = typeof toolName === 'string' && isIdentifier(toolName) ? sanitize(toolName) : INVALID_TOOL_NAME;
 
-    const prepared = prepareContext(requestId, deps.serverId, toolName, rawArgs);
+    const prepared = prepareContext(requestId, deps.serverId, toolName, rawArgs, readSession(deps.getSession));
     const decision = prepared.ok ? evaluateSafely(prepared.ctx, deps, log, requestId) : prepared.decision;
 
     publishSafely(
@@ -158,7 +161,23 @@ export function createInterceptor(deps: InterceptorDeps): ToolCallHandler {
 
 type Prepared = { ok: true; ctx: ToolCallContext } | { ok: false; decision: PolicyDecision };
 
-function prepareContext(requestId: string, serverId: string, toolName: unknown, rawArgs: unknown): Prepared {
+function readSession(provider: InterceptorDeps['getSession']): SessionContext {
+  if (!provider) return { tainted: false };
+  try {
+    const session = provider();
+    return typeof session?.tainted === 'boolean' ? { tainted: session.tainted } : { tainted: true };
+  } catch {
+    return { tainted: true };
+  }
+}
+
+function prepareContext(
+  requestId: string,
+  serverId: string,
+  toolName: unknown,
+  rawArgs: unknown,
+  session: SessionContext,
+): Prepared {
   const args = rawArgs === undefined ? {} : rawArgs;
   if (!isPlainObject(args)) {
     return invalid('Tool arguments must be a JSON object');
@@ -175,7 +194,7 @@ function prepareContext(requestId: string, serverId: string, toolName: unknown, 
     return invalid('Tool arguments could not be copied');
   }
 
-  const ctx = { requestId, serverId, toolName, arguments: frozen };
+  const ctx = { requestId, serverId, toolName, arguments: frozen, session };
   // Validate only: the parsed output is a rebuilt copy, and the evaluator must see `frozen` itself.
   if (!ToolCallContextSchema.safeParse(ctx).success) {
     return invalid('Tool call name or identifiers are invalid');
