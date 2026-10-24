@@ -269,7 +269,7 @@ export async function preflightDocker(image: string, execFile: ExecFileFn = defa
     await execFile('docker', ['version', '--format', '{{.Server.Version}}'], options);
   } catch (err) {
     throw new SandboxUnavailableError(
-      `sandbox mode requires Docker, and Docker is not available (${errorCode(err)}); refusing to start`,
+      `sandbox mode requires Docker, and ${dockerUnavailableReason(err)}; refusing to start`,
     );
   }
   try {
@@ -459,10 +459,21 @@ function pipeStderr(stderr: Readable | null, tag: string): void {
   });
 }
 
+/** A string errno code, `exit N` for a child's numeric exit status, or the error's class name. */
 function errorCode(err: unknown): string {
   if (typeof err === 'object' && err !== null && 'code' in err) {
     const code = (err as { code: unknown }).code;
     if (typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code)) return code;
+    if (typeof code === 'number' && Number.isInteger(code)) return `exit ${code}`;
   }
   return err instanceof Error ? err.constructor.name : 'unknown';
+}
+
+/** Why `docker version` failed: no CLI, or a CLI whose daemon did not answer (non-zero exit or timeout). */
+function dockerUnavailableReason(err: unknown): string {
+  const code = errorCode(err);
+  if (code === 'ENOENT') return 'docker CLI not found';
+  const timedOut = typeof err === 'object' && err !== null && (err as { killed?: unknown }).killed === true;
+  if (code.startsWith('exit ') || timedOut) return "the Docker daemon isn't responding (is Docker running?)";
+  return `Docker is not available (${code})`;
 }

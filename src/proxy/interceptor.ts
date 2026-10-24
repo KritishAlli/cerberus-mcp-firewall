@@ -9,6 +9,8 @@
  *   4. ALLOW → return await deps.forward(...) unchanged (the only forward call site)
  *      anything else → BLOCKED tool error; forward is NOT called
  *   5. forward throws → DOWNSTREAM ERROR tool error with a fixed message, never an implicit ALLOW
+ *   With deps.staging, step 4 runs inside runStagedCall (src/proxy/staged-call.ts): the
+ *   server's file changes are diffed, evaluated and applied or reverted around the forward.
  *
  * Nothing here ever puts an argument value or a downstream error message into a
  * response, event or log line: both can echo secrets.
@@ -28,6 +30,7 @@ import {
   type SessionContext,
   type ToolCallContext,
 } from '../shared/contracts.js';
+import { runStagedCall, type StagingDeps } from './staged-call.js';
 
 /** Start of the text of every DENY result. Stable: tests and the demo match on it. */
 export const BLOCKED_PREFIX = '[MCP Firewall] BLOCKED';
@@ -65,6 +68,8 @@ export interface InterceptorDeps {
   now?: () => number;
   /** Current session taint state. If the provider fails, sensitive calls fail closed as tainted. */
   getSession?: () => SessionContext;
+  /** Staged writes for a sandboxed server. Without it, allowed calls are forwarded as before. */
+  staging?: StagingDeps;
 }
 
 /** toolName and rawArgs are untrusted and validated here, hence `unknown`. */
@@ -117,14 +122,34 @@ export function createInterceptor(deps: InterceptorDeps): ToolCallHandler {
     );
 
     if (prepared.ok && decision.decision === 'ALLOW') {
-      try {
-        // The single forward call site. Same frozen object the evaluator saw.
-        return await deps.forward(prepared.ctx.toolName, prepared.ctx.arguments, forwardOptions(options));
-      } catch (err) {
-        const kind = classifyDownstreamError(err);
-        log(`[firewall] request ${sanitize(requestId)} downstream error: ${describeError(err)} → ${kind}`);
-        return downstreamErrorResult(kind, decision, requestId);
-      }
+      const ctx = prepared.ctx;
+      const forward = async (): Promise<CallToolResult> => {
+        try {
+          // The single forward call site. Same frozen object the evaluator saw.
+          return await deps.forward(ctx.toolName, ctx.arguments, forwardOptions(options));
+        } catch (err) {
+          const kind = classifyDownstreamError(err);
+          log(`[firewall] request ${sanitize(requestId)} downstream error: ${describeError(err)} → ${kind}`);
+          return downstreamErrorResult(kind, decision, requestId);
+        }
+      };
+      if (!deps.staging) return forward();
+      return runStagedCall(
+        deps.staging,
+        {
+          serverId: deps.serverId,
+          requestId: sanitize(requestId),
+          toolName: displayName,
+          now,
+          log,
+          errorResult: (text) => ({
+            isError: true,
+            content: [{ type: 'text', text }],
+            _meta: { [FIREWALL_META_KEY]: meta(decision, requestId) },
+          }),
+        },
+        forward,
+      );
     }
     return blockedResult(decision, requestId);
   };
