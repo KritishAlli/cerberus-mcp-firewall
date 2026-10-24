@@ -1,18 +1,19 @@
 /**
  * OWNER: Aarav — the MCP server that Claude Code connects to (design doc §6.2, §6.6).
  *
- * SCAFFOLD STUB.
+ * Uses the low-level Server, not McpServer: McpServer builds tools/list from
+ * its own registered schemas, while the proxy must re-expose the downstream
+ * names, descriptions and JSON Schemas unchanged. Descriptions are untrusted
+ * text; they are passed through but never used as policy input.
  *
- * Verified in the pinned SDK (@modelcontextprotocol/server@2.4.0):
- *   import { Server, McpServer } from '@modelcontextprotocol/server';
- *   import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
- * The low-level Server is likely the better fit: tools/list must re-expose the
- * downstream JSON Schemas unchanged, and McpServer expects its own schemas.
+ * The downstream server's `instructions` are NOT forwarded: they are untrusted
+ * text that would otherwise land in the agent's context.
  *
- * TODO(Aarav): tools/list → upstream.listTools() (names/descriptions/schemas
- * preserved; descriptions are untrusted text), tools/call → handleToolCall.
+ * Only tools are proxied. Resources, prompts and list_changed are not offered.
  * stdout is protocol-only; diagnostics go to stderr.
  */
+import { Server, type Transport } from '@modelcontextprotocol/server';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import type { ToolCallHandler } from './interceptor.js';
 import type { UpstreamConnection } from './upstream.js';
 
@@ -20,9 +21,38 @@ export interface ProxyServerHandle {
   close(): Promise<void>;
 }
 
+export interface ProxyServerOptions {
+  /** Defaults to a StdioServerTransport on this process's stdin/stdout. Tests pass an InMemoryTransport. */
+  transport?: Transport;
+  /** Called when the agent side disconnects. */
+  onClose?: () => void;
+}
+
 export async function startProxyServer(
-  _upstream: UpstreamConnection,
-  _handleToolCall: ToolCallHandler,
+  upstream: UpstreamConnection,
+  handleToolCall: ToolCallHandler,
+  options: ProxyServerOptions = {},
 ): Promise<ProxyServerHandle> {
-  throw new Error('startProxyServer: not implemented yet (Aarav)');
+  const server = new Server({ name: 'mcp-firewall', version: '0.1.0' }, { capabilities: { tools: {} } });
+
+  server.setRequestHandler('tools/list', async () => {
+    try {
+      return { tools: await upstream.listTools() };
+    } catch (err) {
+      process.stderr.write(`[firewall] tools/list failed: ${err instanceof Error ? err.constructor.name : typeof err}\n`);
+      throw new Error('MCP Firewall: the tool server is unavailable');
+    }
+  });
+
+  server.setRequestHandler('tools/call', (request, ctx) =>
+    handleToolCall(request.params.name, request.params.arguments, { signal: ctx.mcpReq.signal }),
+  );
+
+  server.onclose = () => options.onClose?.();
+  server.onerror = (err) => {
+    process.stderr.write(`[firewall] agent connection error: ${err.constructor.name}\n`);
+  };
+
+  await server.connect(options.transport ?? new StdioServerTransport());
+  return { close: () => server.close() };
 }
