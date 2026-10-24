@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Logs, including the optional redacted JSONL event log (design §8)
+*.log
+*.jsonl
+
+# Env files: the policy protects **/.env, so never commit one
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Test coverage
+coverage/
