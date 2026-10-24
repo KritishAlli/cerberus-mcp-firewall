@@ -5,7 +5,8 @@
  * 2. Integration: agent Client → proxy (InMemoryTransport) → real stdio fixture
  *    (tests/fixtures/counting-server.ts). Received counts are read directly from
  *    the fixture via upstream.callTool('get_call_counts'), bypassing the proxy.
- * 3. CLI smoke: spawn src/index.ts with a temp config and read the fixture's counts file.
+ * 3. CLI smoke: spawn src/index.ts with a temp config and read the fixture's counts file;
+ *    a failed sandbox-mode startup leaves no staging dir.
  * 4. CLI with Kritish's demo/mock-server.ts as the downstream, the shipped config/firewall.yaml
  *    policy and Winston's real evaluator (read-only use of demo/* and src/security/*).
  * 5. Vertical slice: CLI → interceptor → publishEvent → event bus → monitor SSE on a free port.
@@ -13,6 +14,7 @@
  *    tests/fixtures/malicious-server.ts as a local stdio process rooted at the staging dir
  *    (no Docker). Everything lives in mkdtemp dirs.
  */
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
@@ -726,6 +728,74 @@ describe('proxy / CLI smoke (src/index.ts)', () => {
     expect(stderr).not.toContain(DUMMY_SECRET);
     expect(stderr).not.toContain(ARG_SECRET);
   });
+});
+
+describe('proxy / CLI startup failure in sandbox mode (src/index.ts)', () => {
+  const runningAsRoot = process.getuid?.() === 0;
+  let dir: string;
+  let project: string;
+  let stagingParent: string;
+
+  beforeAll(async () => {
+    dir = await realpath(await mkdtemp(join(tmpdir(), 'mcp-firewall-startup-')));
+    project = join(dir, 'project');
+    stagingParent = join(dir, 'tmp');
+    await mkdir(join(project, 'src'), { recursive: true });
+    await writeFile(join(project, 'src/app.ts'), 'export {};\n');
+    await mkdir(stagingParent);
+  });
+
+  afterAll(async () => {
+    if (!dir) return;
+    await chmod(join(project, 'locked'), 0o755).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /** Runs the CLI in sandbox mode with os.tmpdir() pointed at stagingParent. */
+  const start = (image: string) => {
+    const configPath = join(dir, `${image.replace(/\W/g, '-')}.yaml`);
+    const config = {
+      server: { id: 'fs', command: 'node', args: ['/server/index.js'], timeoutMs: 10_000, sandbox: { image, project } },
+      monitor: { enabled: false },
+      policy: { defaultDecision: 'DENY', staging: { writablePaths: ['src/**'], protectedWritePaths: ['.git/**'], maxFileBytes: 4096, maxChangesPerCall: 20 } },
+    };
+    // JSON is valid YAML.
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+    return spawnSync(process.execPath, ['--import', 'tsx', resolve(repoRoot, 'src/index.ts'), '--config', configPath], {
+      cwd: repoRoot,
+      env: { ...process.env, TMPDIR: stagingParent },
+      input: '',
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
+  };
+
+  const stagingDirsLeft = async (): Promise<string[]> =>
+    (await readdir(stagingParent)).filter((name) => name.startsWith('mcp-firewall-staging-'));
+
+  it('preflight fails (image missing): exits 1 and removes the staging dir', async () => {
+    const result = start('mcp-firewall-test-missing-image:none');
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/\[firewall\] fatal: sandbox mode requires Docker|\[firewall\] fatal: sandbox image "mcp-firewall-test-missing-image:none" was not found locally/);
+    expect(result.stderr).not.toContain('after a failed start');
+    expect(await stagingDirsLeft()).toEqual([]);
+  }, 40_000);
+
+  it.skipIf(runningAsRoot)('sync fails (unreadable project dir): exits 1 and removes the staging dir (skipped as root)', async () => {
+    await mkdir(join(project, 'locked'));
+    await chmod(join(project, 'locked'), 0o000);
+    try {
+      const result = start('mcp-firewall-test-sync-fails:none');
+      expect(result.status).toBe(1);
+      // Fails in sync() itself, after the staging dir exists, before Docker is touched.
+      expect(result.stderr).toMatch(/\[firewall\] fatal: EACCES/);
+      expect(result.stderr).not.toContain('after a failed start');
+      expect(await stagingDirsLeft()).toEqual([]);
+    } finally {
+      await chmod(join(project, 'locked'), 0o755);
+      await rm(join(project, 'locked'), { recursive: true });
+    }
+  }, 40_000);
 });
 
 // ---------------------------------------------------------------------------

@@ -1,17 +1,19 @@
 /**
  * AARAV — src/proxy/staging.ts against real temp directories: sync excludes,
  * diff kinds, path safety, apply (atomic, conflict-checked, defense in depth),
- * revert, ordering and the staging lock.
+ * revert, ordering, the staging lock, and the owner file and stale-dir sweep.
  */
-import { chmod, link, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { chmod, link, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   createStagingArea,
   resolveInRoot,
   StagingError,
   StagingLock,
+  sweepStaleStagingDirs,
   type StagingArea,
 } from '../src/proxy/staging.js';
 import type { ChangeDecision, FileChange } from '../src/shared/contracts.js';
@@ -315,5 +317,116 @@ describe('staging / lock', () => {
       'b',
     ]);
     expect(log).toEqual(['a:start', 'a:end', 'b:start', 'b:end']);
+  });
+});
+
+describe('staging / owner file', () => {
+  it('sits next to the mirror, never in it, and is never reported as a change', async () => {
+    const dir = dirname(area.stagingRoot);
+    expect(basename(dir)).toMatch(/^mcp-firewall-staging-[A-Za-z0-9]{6}$/);
+    expect((await readdir(dir)).sort()).toEqual(['owner.json', 'tree']);
+    const owner = JSON.parse(await readFile(join(dir, 'owner.json'), 'utf8')) as { pid: number; startedAt: string };
+    expect(owner.pid).toBe(process.pid);
+    expect(Number.isNaN(Date.parse(owner.startedAt))).toBe(false);
+    expect((await stat(join(dir, 'owner.json'))).mode & 0o777).toBe(0o600);
+
+    await put(join(tmp, 'project'), 'a.txt', 'a');
+    const { staging } = await area.sync();
+    expect(await staged()).toEqual(['a.txt']);
+    expect(await area.diff(staging)).toEqual([]);
+  });
+
+  it('is removed with the mirror on dispose()', async () => {
+    const dir = dirname(area.stagingRoot);
+    await area.dispose();
+    await expect(lstat(dir)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
+describe('staging / stale-dir sweep', () => {
+  const uid = process.getuid!();
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  let parent: string;
+  let lines: string[];
+  const sweep = (extra: { uid?: number } = {}) =>
+    sweepStaleStagingDirs({ parent, log: (line) => lines.push(line), ...extra });
+
+  /** A pid that has exited and been reaped. */
+  const deadPid = (): number => {
+    const { pid } = spawnSync(process.execPath, ['-e', '']);
+    if (pid === undefined) throw new Error('could not spawn');
+    return pid;
+  };
+
+  async function stagingDir(name: string, owner?: unknown): Promise<string> {
+    const dir = join(parent, name);
+    await mkdir(join(dir, 'tree'), { recursive: true });
+    await writeFile(join(dir, 'tree/a.txt'), 'project copy');
+    if (owner !== undefined) await writeFile(join(dir, 'owner.json'), JSON.stringify(owner));
+    return dir;
+  }
+
+  const exists = async (p: string): Promise<boolean> => lstat(p).then(() => true, () => false);
+
+  beforeEach(async () => {
+    parent = join(tmp, 'sweep');
+    await mkdir(parent);
+    lines = [];
+  });
+
+  it("removes a dir whose owner's pid is gone, and logs only the count and names", async () => {
+    const dir = await stagingDir('mcp-firewall-staging-dead01', { pid: deadPid(), startedAt: '2026-01-01T00:00:00Z' });
+    expect(await sweep()).toEqual(['mcp-firewall-staging-dead01']);
+    expect(await exists(dir)).toBe(false);
+    expect(lines).toEqual(['[firewall] staging: removed 1 stale staging dir(s): mcp-firewall-staging-dead01']);
+  });
+
+  it('keeps a dir whose owner is alive', async () => {
+    const dir = await stagingDir('mcp-firewall-staging-live01', { pid: process.pid, startedAt: '2026-01-01T00:00:00Z' });
+    expect(await sweep()).toEqual([]);
+    expect(await exists(join(dir, 'tree/a.txt'))).toBe(true);
+    expect(lines).toEqual([]);
+  });
+
+  it('never follows a symlink that matches the prefix', async () => {
+    const target = await stagingDir('elsewhere', { pid: deadPid(), startedAt: '2026-01-01T00:00:00Z' });
+    const link = join(parent, 'mcp-firewall-staging-LINK01');
+    await symlink(target, link);
+    expect(await sweep()).toEqual([]);
+    expect((await lstat(link)).isSymbolicLink()).toBe(true);
+    expect(await exists(join(target, 'tree/a.txt'))).toBe(true);
+  });
+
+  it("leaves another user's dirs and dirs with other names alone", async () => {
+    const owner = { pid: deadPid(), startedAt: '2026-01-01T00:00:00Z' };
+    const ours = await stagingDir('mcp-firewall-staging-dead02', owner);
+    const others = [
+      await stagingDir('mcp-firewall-staging-test-dead03', owner),
+      await stagingDir('mcp-firewall-staging-dead0', owner),
+      await stagingDir('other-dead04', owner),
+    ];
+    // As another uid, our own dir is someone else's.
+    expect(await sweep({ uid: uid + 1 })).toEqual([]);
+    expect(await exists(ours)).toBe(true);
+    expect(await sweep()).toEqual(['mcp-firewall-staging-dead02']);
+    for (const dir of others) expect(await exists(dir)).toBe(true);
+  });
+
+  it('keeps a dir without a usable owner file until it is 24 hours old', async () => {
+    const missing = await stagingDir('mcp-firewall-staging-nownr1');
+    const groupPid = await stagingDir('mcp-firewall-staging-nownr2', { pid: 0, startedAt: 'x' });
+    const garbage = await stagingDir('mcp-firewall-staging-nownr3');
+    await writeFile(join(garbage, 'owner.json'), '{not json');
+    expect(await sweep()).toEqual([]);
+    for (const dir of [missing, groupPid, garbage]) expect(await exists(dir)).toBe(true);
+
+    const old = new Date(Date.now() - DAY_MS - 60_000);
+    for (const dir of [missing, groupPid, garbage]) await utimes(dir, old, old);
+    expect(await sweep()).toEqual(['mcp-firewall-staging-nownr1', 'mcp-firewall-staging-nownr2', 'mcp-firewall-staging-nownr3']);
+  });
+
+  it('never throws: a failed sweep is logged and returns nothing', async () => {
+    await expect(sweepStaleStagingDirs({ parent: join(tmp, 'missing'), log: (line) => lines.push(line) })).resolves.toEqual([]);
+    expect(lines).toEqual(['[firewall] staging: stale staging dir sweep failed (ENOENT)']);
   });
 });
