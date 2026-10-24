@@ -1,0 +1,4 @@
+# The build context is this directory; only the manifest and lockfile go into the image.
+*
+!package.json
+!package-lock.json

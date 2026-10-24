@@ -15,6 +15,7 @@
     "dev": "tsx src/index.ts --config config/firewall.yaml",
     "mock-server": "tsx demo/mock-server.ts",
     "demo": "tsx demo/scenarios.ts",
+    "sandbox:build": "docker build -t mcp-firewall-sandbox:dev demo/sandbox",
     "check": "npm run typecheck && npm test"
   },
   "dependencies": {

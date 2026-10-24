@@ -261,6 +261,14 @@ describe('sandbox + staging config', () => {
     );
   });
 
+  it('the shipped config/sandbox.yaml loads and maps to a valid docker launch', () => {
+    const config = loadConfig(resolve(examplePath, '../sandbox.yaml'));
+    expect(config.server.sandbox?.project).toBe(realpathSync(resolve(examplePath, '../../demo/project')));
+    const launch = toUpstreamLaunch(config.server, realpathSync(tmpdir()));
+    expect(launch).toMatchObject({ mode: 'docker', image: 'mcp-firewall-sandbox:dev' });
+    expect(UpstreamLaunchSchema.safeParse(launch).success).toBe(true);
+  });
+
   it('serverDir is optional', () => {
     const path = writeSandboxConfig('{ image: fw-sandbox, project: project }');
     expect(loadConfig(path).server.sandbox?.serverDir).toBeUndefined();
