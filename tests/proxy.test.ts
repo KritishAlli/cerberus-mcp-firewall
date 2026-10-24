@@ -1560,7 +1560,10 @@ describe('proxy / staged writes', () => {
     expect(stagedOf(next)?.changes).toEqual([{ path: 'src/ok.ts', decision: 'ALLOW', ruleId: 'APPROVED_TOOL' }]);
   });
 
-  it('a large excluded file is reported with its size, never read, rejected and removed', async () => {
+  // Root can read a mode-000 file, so the "never read" check would prove nothing.
+  const runningAsRoot = process.getuid?.() === 0;
+  if (runningAsRoot) process.stderr.write('[staged writes] skipping the mode-000 test: running as root, which can read mode-000 files\n');
+  it.skipIf(runningAsRoot)('a large excluded file is reported with its size, never read, rejected and removed (skipped as root)', async () => {
     let seen: FileChange[] = [];
     stack = await startStaged({
       changeEvaluator: (changes, p) => {
@@ -1598,6 +1601,32 @@ describe('proxy / staged writes', () => {
     await expect(area.apply(changes, stale, pre.project)).rejects.toThrow(/changed after it was scanned/);
     expect(await fingerprint(stack.project)).toEqual(before);
     expect(await readFile(join(stack.project, 'README.md'), 'utf8')).toBe('# Demo project\n');
+  });
+
+  it('sync() warns once about project files with unsafe names and does not mirror them', async () => {
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'mcp-firewall-unsafe-project-')));
+    try {
+      const project = join(dir, 'project');
+      await makeProject(project);
+      await writeFile(join(project, 'src', 'we\\ird.ts'), 'export const secret = "not logged";\n');
+      await writeFile(join(project, 'tab\tname.md'), 'x');
+      const logs: string[] = [];
+      const area = await createStagingArea({ projectRoot: project, stagingParent: dir, maxFileBytes: 1024, log: (l) => logs.push(l) });
+      const { project: manifest } = await area.sync();
+      expect(logs).toEqual([
+        '[firewall] staging: 2 project file(s) with unsafe names are not mirrored into staging: src/we%5Cird.ts, tab%09name.md',
+      ]);
+      expect(logs.join('')).not.toContain('not logged');
+      expect([...manifest.keys()].some((k) => k.includes('ird') || k.includes('name.md'))).toBe(false);
+      const stagedSrc = (await readdir(join(area.stagingRoot, 'src'), { encoding: 'buffer' })).map((b) => b.toString('latin1'));
+      expect(stagedSrc.sort()).toEqual(['app.ts', 'run.sh']);
+      expect(await exists(join(area.stagingRoot, 'tab\tname.md'))).toBe(false);
+
+      await area.sync();
+      expect(logs).toHaveLength(2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('emits FileChangeEvents only when there are changes', async () => {

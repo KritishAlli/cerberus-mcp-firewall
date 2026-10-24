@@ -104,6 +104,8 @@ From `src/proxy/interceptor.ts`:
 
 ## Blockers
 
+- **Docker is not installed on Aarav's machine.** The Docker integration tests in `tests/upstream-docker.test.ts` (3, always skipped here) and the sandboxed demo can't be run until it is. Install Docker Desktop and `docker pull node:22-slim`, or run them on a teammate's machine.
+
 
 - ~~`src/security/evaluator.ts` is the deny-all stub~~: Winston's real evaluator landed on `main` in PR #4 (`40ea8e4`). With the shipped policy it returns ALLOW / PROTECTED_PATH / DENIED_DESTINATION / DENIED_TOOL for the four demo calls, consistent with design §7.
 - ~~`demo/mock-server.ts` is a stub~~: landed in PR #3 (`6a7f51d`).
@@ -154,12 +156,16 @@ Not changed in `src/shared/contracts.ts`; each needs Aarav, Winston and Kritish 
    - ~~`src/proxy/staging.ts`~~: merged (PR #11).
    - ~~Docker launch mode in upstream~~: merged (PR #12). Its integration tests still need a run on a machine with Docker and `node:22-slim`.
    - ~~Interceptor integration~~: built on `aarav/interceptor-staging`.
-   - **Next: `src/index.ts` wiring** (not done; out of scope for that branch). When the config has `server.sandbox` (Kritish's loader), index.ts must, in order:
-     1. `createStagingArea({ projectRoot, extraExcludes, maxFileBytes: policy.staging.maxFileBytes })`. Refuse to start if `policy.staging` is missing.
-     2. `initial = await area.sync()`
-     3. `connectUpstream(config.server, { launch: { mode: 'docker', workspaceDir: area.stagingRoot, … } })`
-     4. `await initStaging(staging, { serverId, initial })` (let it throw)
-     5. pass `staging` to `createInterceptor`, with `onFileChangeEvent` wired to the monitor (Kritish)
-     6. `area.dispose()` on shutdown
+   - **Next, in order:**
+     1. **Run the docker-upstream integration tests on `main` with Docker.** docker-upstream (PR #12) is merged, but its 3 Docker integration tests have never run. Running them is the next step once Docker is installed (see Blockers). Fix anything they find before building on it.
+     2. **Kritish: `toUpstreamLaunch` in the config loader.** Map `server.sandbox` (and `policy.staging`) onto `UpstreamLaunch` from `src/proxy/upstream.ts`. Refuse to load if sandbox mode is set without `policy.staging`.
+     3. **`src/index.ts` wiring**, in this order. Each step must throw and stop startup on failure:
+        1. `createStagingArea({ projectRoot, extraExcludes, maxFileBytes, maxChangesPerCall })` from `policy.staging`
+        2. `initial = await area.sync()`
+        3. `toUpstreamLaunch(config, area.stagingRoot)` → docker launch with `workspaceDir` = the staging dir
+        4. preflight + launch: `connectUpstream(config.server, { launch })` (runs `docker version` / `docker image inspect` first)
+        5. `await initStaging(staging, { serverId, initial })`
+
+        Then pass `staging` to `createInterceptor` (with `onFileChangeEvent` wired to the monitor, Kritish), and call `area.dispose()` on shutdown.
    - Swap the reject-all stub for Winston's `evaluateFileChanges` once `src/security/changes.ts` lands.
 7. Optional, after acceptance tests: forward `list_changed`. Consider logging a clearer warning when the monitor port is taken, e.g. "events from this instance will not appear in the browser", and logging only the error code instead of the full `EADDRINUSE` object and stack.

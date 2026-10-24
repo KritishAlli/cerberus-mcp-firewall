@@ -44,6 +44,8 @@ import type { ChangeDecision, FileChange, RuleId } from '../shared/contracts.js'
 export const DEFAULT_EXCLUDES: readonly string[] = ['.git/', 'node_modules/', '.env', '.env.*'];
 
 const HASH_CHUNK_BYTES = 64 * 1024;
+/** Escaped paths listed in sync()'s warning about unmirrored project files. */
+const MAX_LOGGED_UNSAFE = 10;
 /** Read-only, no final symlink, and no blocking if a FIFO was swapped in after lstat. */
 const SAFE_READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
@@ -110,6 +112,8 @@ export interface StagingOptions {
    * this many + 1 entries, so the evaluator's CHANGE_LIMIT rejects the batch. Default 1000.
    */
   maxChangesPerCall?: number;
+  /** Diagnostics sink (one line, no trailing newline). Defaults to stderr. */
+  log?: (line: string) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +249,7 @@ interface ScanSink {
  * into `sink` for a staging diff. Names are read as raw bytes, so even a name that
  * is not valid UTF-8 can be reported and removed.
  */
-async function scan(root: string, rules: ExcludeRule[], sink?: ScanSink): Promise<Manifest> {
+async function scan(root: string, rules: ExcludeRule[], sink?: ScanSink, skipped?: string[]): Promise<Manifest> {
   const manifest: Manifest = new Map();
   const visit = async (dirRel: string): Promise<void> => {
     const dirAbs = dirRel === '' ? root : path.join(root, ...dirRel.split('/'));
@@ -255,6 +259,7 @@ async function scan(root: string, rules: ExcludeRule[], sink?: ScanSink): Promis
       const rel = dirRel === '' ? name : `${dirRel}/${name}`;
       if (!safe) {
         if (sink) await recordUnsafe(sink, rel, dirAbs, raw);
+        else skipped?.push(rel);
         continue;
       }
       const { abs } = resolveInRoot(root, rel);
@@ -471,6 +476,7 @@ export async function createStagingArea(options: StagingOptions): Promise<Stagin
     compileExcludes(excludes),
     options.maxFileBytes,
     options.maxChangesPerCall ?? 1000,
+    options.log ?? ((line: string) => process.stderr.write(`${line}\n`)),
   );
 }
 
@@ -488,11 +494,23 @@ export class StagingArea {
     private readonly rules: ExcludeRule[],
     private readonly maxFileBytes: number,
     private readonly maxChangesPerCall: number,
+    private readonly log: (line: string) => void,
   ) {}
 
-  /** Makes staging an exact mirror of the project minus excludes. */
+  /**
+   * Makes staging an exact mirror of the project minus excludes. Project files
+   * with unsafe names are not mirrored; each sync logs one warning listing them.
+   */
   async sync(): Promise<SyncResult> {
-    const project = await scan(this.projectRoot, this.rules);
+    const skipped: string[] = [];
+    const project = await scan(this.projectRoot, this.rules, undefined, skipped);
+    if (skipped.length > 0) {
+      const listed = skipped.slice(0, MAX_LOGGED_UNSAFE).join(', ');
+      const more = skipped.length > MAX_LOGGED_UNSAFE ? `, and ${skipped.length - MAX_LOGGED_UNSAFE} more` : '';
+      this.log(
+        `[firewall] staging: ${skipped.length} project file(s) with unsafe names are not mirrored into staging: ${listed}${more}`,
+      );
+    }
     await this.pruneStaging('', project);
     const current = await scan(this.stagingRoot, this.rules);
     for (const [rel, entry] of project) {
