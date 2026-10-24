@@ -65,6 +65,8 @@ const policy: FirewallPolicy = {
   writeTools: [],
 };
 
+const DOCKER_VERSION_JSON = JSON.stringify({ Client: { Version: '29.9.2' }, Server: { Version: '29.9.2' } });
+
 const ALLOW: PolicyDecision = { decision: 'ALLOW', ruleId: 'APPROVED_TOOL', reason: 'test allow' };
 const DENY: PolicyDecision = { decision: 'DENY', ruleId: 'DENIED_TOOL', reason: 'test deny' };
 
@@ -378,7 +380,7 @@ describe('1d Docker preflight and no local fallback', () => {
     const { attempt, spawned } = await dockerLaunchAttempt(async (_file, args) => {
       calls.push([...args]);
       if (args[0] === 'image') throw Object.assign(new Error('no such image'), { code: 1 });
-      return { stdout: '29.9.2\n', stderr: '' };
+      return { stdout: DOCKER_VERSION_JSON, stderr: '' };
     });
     await expect(attempt).rejects.toBeInstanceOf(SandboxUnavailableError);
     expect(spawned()).toBe(0);
@@ -457,7 +459,7 @@ describe('1f container cleanup', () => {
         launch: { mode: 'docker', image: 'mcp-firewall-sandbox:dev', command: 'node', workspaceDir: ws },
         execFile: async (_file, args) => {
           dockerCalls.push([...args]);
-          return { stdout: '', stderr: '' };
+          return { stdout: args[0] === 'version' ? DOCKER_VERSION_JSON : '', stderr: '' };
         },
         // Stand-in for `docker run`: the real argv is recorded, the fixture runs locally.
         createTransport: (params) => {
@@ -491,7 +493,7 @@ describe('1f container cleanup', () => {
         launch: { mode: 'docker', image: 'mcp-firewall-sandbox:dev', command: 'node', workspaceDir: ws },
         execFile: async (_file, args) => {
           if (args[0] === 'rm') order.push('docker rm -f');
-          return { stdout: '', stderr: '' };
+          return { stdout: args[0] === 'version' ? DOCKER_VERSION_JSON : '', stderr: '' };
         },
         createTransport: () => {
           const transport = new StdioClientTransport({ command: process.execPath, args: [fixture], stderr: 'pipe' });
@@ -583,7 +585,7 @@ describe('1f container cleanup', () => {
         execFile: async (_file, args) => {
           order.push(args[0]!);
           if (args[0] === 'ps') throw Object.assign(new Error('ps failed'), { code: 'EIO' });
-          return { stdout: '', stderr: '' };
+          return { stdout: args[0] === 'version' ? DOCKER_VERSION_JSON : '', stderr: '' };
         },
         createTransport: (p) => {
           order.push('launch');
