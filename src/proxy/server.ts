@@ -14,6 +14,7 @@
  */
 import { Server, type Transport } from '@modelcontextprotocol/server';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import type { ApprovalClient } from './client-approval.js';
 import type { ToolCallHandler } from './interceptor.js';
 import type { UpstreamConnection } from './upstream.js';
 
@@ -26,6 +27,8 @@ export interface ProxyServerOptions {
   transport?: Transport;
   /** Called when the agent side disconnects. */
   onClose?: () => void;
+  /** Receives the agent client for override dialogs (MCP form elicitation). */
+  onClient?: (client: ApprovalClient) => void;
 }
 
 export async function startProxyServer(
@@ -47,6 +50,15 @@ export async function startProxyServer(
   server.setRequestHandler('tools/call', (request, ctx) =>
     handleToolCall(request.params.name, request.params.arguments, { signal: ctx.mcpReq.signal }),
   );
+
+  options.onClient?.({
+    supportsFormElicitation: () => {
+      const elicitation = server.getClientCapabilities()?.elicitation;
+      // A bare `elicitation: {}` predates modes and means form support.
+      return elicitation !== undefined && (elicitation.form !== undefined || elicitation.url === undefined);
+    },
+    elicit: (params, requestOptions) => server.elicitInput(params, requestOptions),
+  });
 
   server.onclose = () => options.onClose?.();
   server.onerror = (err) => {
