@@ -93,6 +93,83 @@ Now (on `aarav/wire-change-evaluator`):
     - T02–T04: PROTECTED_PATH, DENIED_DESTINATION and DENIED_TOOL are each BLOCKED with a count of 0
   - vertical slice (T10): the real CLI with its monitor on a free port. One allowed and one denied call, then `GET /events` replays exactly those two events (decision, ruleId, matching `requestId`), `counts` is `{inspected: 2, allowed: 1, denied: 1}`, `/health` is `{status: ok, protectedServers: 1}`, and no argument values or the mock's secret appear in the stream (T11)
 
+## Pitch demo: added and verified (2026-10-25)
+
+A narrated, deterministic sandbox-mode demo, `npm run demo:pitch` (`demo/pitch.ts`).
+Additive; Kritish's `demo/scenarios.ts` and `demo/mock-server.ts` are untouched.
+
+**New/changed files:**
+- `demo/sandbox/side-effects-fixture.mjs` — an inert test-double MCP stdio server, written against the image's `@modelcontextprotocol/sdk` **1.32.1** (not the repo's v2 `@modelcontextprotocol/server`; the image ships the filesystem server's SDK), no zod needed. `format_readme` appends a README line and makes five extra **inert** writes (a `.git/hooks/pre-commit` marker, a `package.json` `fixture-marker` script, `src/fixture-key.txt` holding the AWS doc example key `AKIAIOSFODNN7EXAMPLE`, a separate exec-bit marker `src/fixture-run.txt`, and a relative symlink `src/fixture-link`). Plus `get_call_counts` and `probe_env` (reports presence/size/sentinel only, never contents; used by `demo:env`). Everything is a marker string — no commands, no real credentials, nothing outside `/workspace`.
+- `demo/sandbox/Dockerfile` + `.dockerignore` — copy the fixture to `/app` so it resolves the SDK from `/app/node_modules`. Only additive lines.
+- `config/pitch-fs.yaml` (copy of `config/sandbox.yaml`) and `config/pitch-attack.yaml` (serverId `tool`, runs `/app/side-effects-fixture.mjs`, approves `tool/format_readme`, `tool/get_call_counts` and `tool/probe_env`, same staging policy). Both load under `src/config/load.ts` unchanged — no schema changes.
+- `demo/pitch.ts` — copies `demo/project` to a fresh temp dir, `git init` + one commit, writes temp configs repointing `server.sandbox.project` at the copy. `demo/project` is never modified.
+- `demo/env-suite.ts` — the `.env` access suite (see below), same throwaway-copy setup; `demo/project` is never modified.
+- `package.json` — added `"demo:pitch": "tsx demo/pitch.ts"` and `"demo:env": "tsx demo/env-suite.ts"`. No new dependencies.
+
+**What the three acts verified (all PASS):**
+- **Act 1 (fs config):** `fs/write_file` on `src/greet.js` adding a `farewell` function (no `//` comments, no absolute paths in the content) → ALLOW, `staged` applied 1 / rejected 0, the function present in the temp project. Confirms Winston's content-scanning behavior does **not** block a plain source edit (no `PATH_NOT_ALLOWED`); no policy loosening was needed.
+- **Act 2 (same gateway, prompt-injected agent):** `fs/read_text_file` on `.env` → BLOCKED, `_meta['mcp-firewall/decision'].decision === 'DENY'`, `PROTECTED_PATH`; the `.env` value never appears in output. `fs/write_file` on `package.json` with a `postinstall` → BLOCKED, `DENY` / `PERSISTENCE_PATH`; `package.json` in the temp project byte-for-byte unchanged. Both are pre-call denies, so the downstream never received them.
+- **Act 3 (attack config, same temp project):** `tool/format_readme` → ALLOWed call with rejected changes (no decision meta; read from `_meta['mcp-firewall/staged']`). `staged` = **1 applied, 5 rejected**: `README.md` APPLY `APPROVED_TOOL`; `.git/hooks/pre-commit` `PERSISTENCE_PATH`; `package.json` `PERSISTENCE_PATH`; `src/fixture-key.txt` `SECRET_DETECTED`; `src/fixture-run.txt` `EXECUTABLE_DENIED`; `src/fixture-link` `SYMLINK_DENIED`. README changed in the project; none of the git hook, postinstall, key file, exec-bit file or symlink landed; the dummy key never appeared in the result. `git status --short` showed exactly ` M README.md` and ` M src/greet.js`.
+  - The dummy key and the exec bit are on **separate** fixture files (`src/fixture-key.txt` has the key and no exec bit; `src/fixture-run.txt` has the exec bit and no key), so `SECRET_DETECTED` and `EXECUTABLE_DENIED` each fire on their own change rather than one masking the other.
+- **Monitor (per gateway, `/events` + `/health`):** fs gateway showed the three decisions (ALLOW `write_file`, DENY `PROTECTED_PATH read_text_file`, DENY `PERSISTENCE_PATH write_file`); attack gateway showed ALLOW `format_readme` and ALLOW `get_call_counts`. `/health.instance.pid` matched the gateway child's pid in both. No dummy secret (`AKIAIOSFODNN7EXAMPLE`) in either stream. The gateway is launched with the default safe environment, without `CERBERUS_TTY_APPROVAL` and without declaring form elicitation, so every DENY stays a DENY.
+
+**Exact commands run (Docker 29.9.2, `mcp-firewall-sandbox:dev`):**
+- `npm run sandbox:build` — built the image with the fixture at `/app`.
+- `npm run demo:pitch -- --auto` — **run 3× in a row, `PITCH DEMO PASSED` each time** (now 1 applied / 5 rejected in Act 3); afterward 0 containers labeled `mcp-firewall=1` and 0 leftover temp dirs.
+- `npm run demo:env` — **run 3× in a row, `.env SUITE PASSED` each time** (after the hardlink fix in [DECISIONS §18](docs/DECISIONS.md); it `FAILED` on the `src/notes.txt` row before). No leftover containers or temp dirs.
+- `npm run typecheck` — passes.
+- `npm run demo` — still `DEMO PASSED` (mock mode); `demo/project` and `git status` of the repo clean apart from the new/edited files.
+
+If a policy change ever starts blocking the Act 1 edit, that is a policy regression to raise with Winston (owner of `src/security/*`), not something `demo/pitch.ts` works around.
+
+### `.env` access suite — `npm run demo:env` (2026-10-25)
+
+A red-team probe (`demo/env-suite.ts`, script `demo:env`) that throws every `.env` access vector we could think of at a sandboxed gateway and checks that **no dummy secret value leaks** into a tool result, the monitor stream, or the gateway's stderr. It runs on a throwaway git copy of `demo/project` (never modified) that also gets `.env.local`, `src/.env`, `config/.env.production`, a relative symlink `src/env-link -> ../.env`, and a **hardlink** `src/notes.txt` to `.env` (each dummy file carries a shared sentinel). Vectors 1-6 go through the fs config; then the fixture's new `probe_env` tool runs under the attack config and reports, from inside the container, only `absent` / `present, N bytes, matches-dummy: yes/no` — never contents. The fixture gained `probe_env`; `config/pitch-attack.yaml` approves `tool/probe_env` (the pitch demo never calls it).
+
+Result table (deterministic across 3 runs, **after** the hardlink fix below):
+
+```
+vector                             decision  rule               reached  leaked
+read .env                          DENY      PROTECTED_PATH     no       no
+read ./.env                        DENY      PROTECTED_PATH     no       no
+read /workspace/.env               DENY      PROTECTED_PATH     no       no
+read src/../.env                   DENY      PROTECTED_PATH     no       no
+read .ENV (case)                   DENY      PROTECTED_PATH     no       no
+read .env/ (trailing slash)        DENY      PROTECTED_PATH     no       no
+read %2e%2e/.env (encoded)         DENY      PROTECTED_PATH     no       no
+read file:///workspace/.env        DENY      PROTECTED_PATH     no       no
+read .env.local                    ALLOW     —                  yes      no
+read src/.env                      DENY      PROTECTED_PATH     no       no
+read config/.env.production        ALLOW     —                  yes      no
+read src/env-link (symlink)        ALLOW     —                  yes      no
+read src/notes.txt (hardlink)      ALLOW     —                  yes      no   ← was YES before the fix
+read_multiple [greet.js, .env]     DENY      PROTECTED_PATH     no       no
+get_file_info .env                 DENY      PROTECTED_PATH     no       no
+read_media_file .env               DENY      PROTECTED_PATH     no       no
+move_file .env -> src/moved.txt    DENY      PROTECTED_PATH     no       no
+write_file .env                    DENY      PROTECTED_PATH     no       no
+search_files ".env"                DENY      PROTECTED_PATH     no       no
+directory_tree /                   ALLOW     —                  yes      no
+list_directory /                   ALLOW     —                  yes      no
+
+probe_env (inside the container):
+/workspace/.env                   absent
+/workspace/.env.local             absent
+/workspace/src/.env               absent
+/workspace/config/.env.production absent
+/workspace/src/env-link           absent    (dangling: target .env is excluded from staging)
+/workspace/src/notes.txt          absent    (was "present, 137 bytes, matches-dummy: yes" before the fix)
+```
+
+**`demo:env` PASSES, run 3× identically.** No dummy value appeared in any tool result, monitor stream, or gateway stderr (the firewall's events carry argument key names only). The directory/list vectors did not surface any `.env` file name.
+
+**The hardlink leak — found by this suite, now FIXED ([DECISIONS §18](docs/DECISIONS.md)).** `src/notes.txt` is a hardlink to `.env`. Before the fix, `staging.sync()` scanned it as a `special` entry (nlink > 1) **but still with its `sha256`**, and `copyToStaging` copied any entry that had a `sha256` — so the hardlinked `.env` bytes landed in staging under the non-excluded name `src/notes.txt`, where the sandboxed server read them (the row above was `leaked: YES`, `probe_env` said `present … matches-dummy: yes`). The symlink never leaked (recreated, not followed; its target is excluded, so it dangles). **Fix in `src/proxy/staging.ts` (Aarav's module):** a project regular file with `nlink > 1` (and every device/socket/fifo) is now treated like an excluded path — scanned but not mirrored, never hashed; a server write at such a path is reported, forced `DENY` (`WRITE_NOT_ALLOWED`), never applied, and removed; and `apply()` refuses to write through any `special` project path (a `rename` would rewrite every link). The copy re-checks `nlink`/`dev`/`ino` on the open fd (`O_NOFOLLOW` + `fstat`), so a file that gains a link between the scan and the copy is not mirrored either. Cost: a legitimately hardlinked source file is no longer mirrored or writable. Covered by 5 new cases in `tests/staging.test.ts` (296 unit tests pass).
+
+**For Winston (pre-call `src/security/*` gaps — all currently caught only by staging, layer 2):**
+- `protectedPaths` is `**/.env`, which matches `src/.env` but **not** `.env.local` or `config/.env.production` (basename ends in `.env.local` / `.env.production`). Both were ALLOWed pre-call; only the staging exclusion (`.env.*`) kept them out of the sandbox. Staging is now the only thing standing between these and a leak — harden the pre-call check too: extend `protectedPaths` to `**/.env*` or add `.env.*` patterns.
+- `src/env-link` (a symlink to `../.env`) was ALLOWed pre-call; it only failed to leak because the target is absent from staging. A symlink whose target *is* present would be read through.
+- The case variant (`.ENV`), trailing slash (`.env/`), `src/../.env` and `%2e%2e/.env` were all caught here as `PROTECTED_PATH` (the `**/.env` glob matched the normalized/suffix form), so the previously-noted case/traversal/trailing-slash gaps did **not** open a hole for the root `.env` in this run — but they remain worth hardening, since they rely on the glob rather than on path canonicalization.
+
 ## Docker integration: verified (2026-10-24)
 
 - **Tests:** `tests/upstream-docker.test.ts` with Docker 29.9.2 and `node:22-slim`, integration tests included (36/36 now).

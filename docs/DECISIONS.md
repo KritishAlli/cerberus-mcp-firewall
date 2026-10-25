@@ -214,3 +214,15 @@ Possible design: when a call is denied and the agent's client declares the form 
 ## 16. Empty directories are staging-only
 
 Team decision: do not add directory changes to the shared `FileChange` contract and do not persist an empty directory to the project just because `create_directory` ran. During a sandbox session, empty directories may remain in the disposable staging tree across calls when they are within `policy.staging.writablePaths` and are not under protected or excluded paths. The staging sync removes untracked files and directories outside that boundary. If a later file change is approved, `apply()` creates its missing parent directories along with the file; the new directories then exist in the project because the approved file requires them. When the gateway exits, staging-only empty directories are discarded.
+
+## 18. Hardlinked (and other non-regular) project files are not mirrored into staging
+
+Owner: Aarav (`src/proxy/staging.ts`). Found by `npm run demo:env` (2026-10-25).
+
+**The hole.** The staging copy excludes secret files (`.env`, `.env.*`, `.git/`, …) so the sandboxed server never sees them. But `sync()` scanned a hardlinked regular file (`nlink > 1`) as a `special` entry that still carried its SHA-256, and `copyToStaging` copied the bytes of any entry that had a SHA-256. So a project file hardlinked to `.env` under a non-excluded name (e.g. `src/notes.txt`) had `.env`'s contents copied into `/workspace`, where the server could read them straight out — a full bypass of the exclusion. A symlink never had this problem: it is recreated, not followed, and its target stays excluded.
+
+**The rule now.** A project path is mirrored into staging only if it is a plain regular file with `nlink === 1` (or a directory, or a symlink, which is recreated). Any regular file with `nlink > 1`, and every device/socket/fifo, is treated exactly like an excluded path: scanned but **not** copied, never hashed, and if the server creates a file at that path in staging the change is reported, forced to `DENY` (`WRITE_NOT_ALLOWED`), never applied, and removed. `apply()` additionally refuses to write through any project path that is `special` at sync or at write time, because a `rename` over a hardlink would silently rewrite every other link (including the real `.env`).
+
+**Race.** The link count is re-checked at copy time, not just at scan time: the source is opened `O_NOFOLLOW`, the open fd is `fstat`'d, and the bytes are copied only if it is still a regular file with `nlink === 1` and the same `dev`/`ino` as the pre-open `lstat`. A file that gains a second link, or is swapped for a symlink, between the scan and the copy is simply not mirrored that sync.
+
+**The cost.** A legitimately hardlinked source file is not mirrored, so the sandboxed server cannot read or edit it, and an edit the server makes to a staging file is not applied to a project path that has become a hardlink (reported as `WRITE_NOT_ALLOWED`, not silently dropped). This is the safe default: refusing to touch multiply-linked files is cheaper than reasoning about which other links a write would change. Messages carry no paths or contents, as before.

@@ -1,4 +1,6 @@
-# The build context is this directory; only the manifest and lockfile go into the image.
+# The build context is this directory; only the manifest, lockfile and the
+# pitch-demo fixture go into the image.
 *
 !package.json
 !package-lock.json
+!side-effects-fixture.mjs

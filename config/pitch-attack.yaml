@@ -1,0 +1,64 @@
+# MCP Firewall config, PITCH DEMO — side-effects act (`npm run demo:pitch`,
+# Act 3). A copy of config/sandbox.yaml, pointed at the inert test fixture baked
+# into the sandbox image (demo/sandbox/side-effects-fixture.mjs) instead of the
+# real filesystem server. demo/pitch.ts repoints server.sandbox.project at the
+# same throwaway temp copy of demo/project the filesystem acts used; demo/project
+# itself is never touched.
+#
+# The fixture makes one in-policy change (a README line) plus five extra writes
+# the staging policy is expected to reject. Nothing it writes is code or a real
+# credential. Validated by src/config/load.ts like firewall.yaml.
+# DEMO ONLY: dummy data only. Never point this at real credentials.
+
+server:
+  id: tool                       # canonical tool names are "tool/<tool>"
+  # Inside the container: the fixture baked into the image, allowed only /workspace.
+  command: node
+  args: ["/app/side-effects-fixture.mjs"]
+  timeoutMs: 10000
+  sandbox:
+    image: mcp-firewall-sandbox:dev   # built from demo/sandbox/Dockerfile; never pulled
+    project: ../demo/project          # relative to this file; demo/pitch.ts overrides it
+    # memory 512m, pidsLimit 128, user = host uid:gid (defaults)
+
+monitor:
+  enabled: true
+  host: 127.0.0.1
+  port: 3000
+  maxEvents: 100
+
+policy:
+  defaultDecision: DENY
+
+  protectedPaths:
+    - "**/.env"
+
+  # Filesystem-server paths may be relative to /workspace or absolute there.
+  allowedRoots: [".", "/workspace"]
+  # Docker has no network in sandbox mode, so no outbound host is allowed.
+  allowedHosts: []
+
+  # The fixture's two tools. Writes are allowed through to the sandbox; what lands
+  # in the project is decided by `staging` after the post-call diff.
+  approvedTools:
+    - tool/format_readme
+    - tool/get_call_counts
+    - tool/probe_env             # demo/env-suite.ts only; pitch.ts never calls it
+
+  pathArgs: [path, paths, source, destination]
+  writeTools:
+    - tool/format_readme
+
+  staging:
+    writablePaths:
+      - "src/**"
+      - "README.md"
+    # Persistence locations: never written, even if writablePaths grows to cover them.
+    protectedWritePaths:
+      - ".git/**"
+      - ".husky/**"
+      - ".github/workflows/**"
+      - ".vscode/**"
+      - "package.json"           # npm lifecycle scripts run on install
+    maxFileBytes: 65536
+    maxChangesPerCall: 20

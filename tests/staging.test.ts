@@ -215,6 +215,93 @@ describe('staging / diff', () => {
       { path: 'hard.txt', kind: 'special', size: 1 },
     ]);
   });
+});
+
+describe('staging / hardlinked project files are not mirrored', () => {
+  it('does not mirror a hardlink to a (excluded) .env', async () => {
+    await put(area.projectRoot, '.env', 'SECRET=topsecret-value\n');
+    await mkdir(join(area.projectRoot, 'src'), { recursive: true });
+    await link(join(area.projectRoot, '.env'), join(area.projectRoot, 'src/notes.txt'));
+
+    await area.sync();
+
+    const names = await staged();
+    expect(names).not.toContain('src/notes.txt');
+    expect(names).not.toContain('.env');
+    // Belt and suspenders: the secret bytes are nowhere in staging.
+    for (const rel of names) {
+      const st = await stat(join(area.stagingRoot, rel));
+      if (st.isFile()) expect(await readFile(join(area.stagingRoot, rel), 'utf8')).not.toContain('topsecret-value');
+    }
+  });
+
+  it('does not mirror a hardlink to a normal file (either name)', async () => {
+    await put(area.projectRoot, 'a.txt', 'shared bytes');
+    await link(join(area.projectRoot, 'a.txt'), join(area.projectRoot, 'b.txt'));
+
+    await area.sync();
+
+    const names = await staged();
+    expect(names).not.toContain('a.txt');
+    expect(names).not.toContain('b.txt');
+  });
+
+  it('denies a server write at a not-mirrored path and leaves the project unchanged', async () => {
+    await put(area.projectRoot, '.env', 'SECRET=topsecret-value\n');
+    await mkdir(join(area.projectRoot, 'src'), { recursive: true });
+    await link(join(area.projectRoot, '.env'), join(area.projectRoot, 'src/notes.txt'));
+    const envBefore = await readFile(join(area.projectRoot, '.env'), 'utf8');
+    const notesBefore = await readFile(join(area.projectRoot, 'src/notes.txt'), 'utf8');
+
+    const { staging, project } = await area.sync();
+    // A hostile server creates a file at the not-mirrored path.
+    await put(area.stagingRoot, 'src/notes.txt', 'injected by server\n');
+    const changes = await area.diff(staging);
+    expect(changes.map((c) => c.path)).toContain('src/notes.txt');
+    expect(area.forcedDenyReason('src/notes.txt')).toBeDefined();
+
+    // Even if the evaluator ALLOWed it, apply must refuse: writing through would
+    // rename over the hardlink and silently change .env.
+    const results = await area.apply(changes, changes.map(allow), project);
+    expect(results.find((r) => r.path === 'src/notes.txt')).toEqual({
+      path: 'src/notes.txt',
+      applied: false,
+      ruleId: 'WRITE_NOT_ALLOWED',
+    });
+
+    await area.revert(['src/notes.txt']);
+    expect(await staged()).not.toContain('src/notes.txt');
+
+    // The project's .env and its hardlink are untouched, still sharing content.
+    expect(await readFile(join(area.projectRoot, '.env'), 'utf8')).toBe(envBefore);
+    expect(await readFile(join(area.projectRoot, 'src/notes.txt'), 'utf8')).toBe(notesBefore);
+    expect((await stat(join(area.projectRoot, '.env'))).nlink).toBe(2);
+  });
+
+  it('does not copy a file that gained a second link since the previous sync', async () => {
+    await put(area.projectRoot, 'c.txt', 'v1');
+    expect(await (async () => { await area.sync(); return staged(); })()).toContain('c.txt');
+
+    // c.txt gains a second link, so the next sync must stop mirroring it.
+    await link(join(area.projectRoot, 'c.txt'), join(area.projectRoot, 'c2.txt'));
+    await area.sync();
+
+    const names = await staged();
+    expect(names).not.toContain('c.txt');
+    expect(names).not.toContain('c2.txt');
+  });
+
+  it('still mirrors and applies a plain regular file', async () => {
+    await put(area.projectRoot, 'keep.txt', 'v1');
+    const { staging, project } = await area.sync();
+    expect(await staged()).toContain('keep.txt');
+
+    await put(area.stagingRoot, 'keep.txt', 'v2');
+    const changes = await area.diff(staging);
+    const results = await area.apply(changes, changes.map(allow), project);
+    expect(results).toEqual([{ path: 'keep.txt', applied: true, ruleId: 'APPROVED_TOOL' }]);
+    expect(await readFile(join(area.projectRoot, 'keep.txt'), 'utf8')).toBe('v2');
+  });
 
   it('fills text only for small valid UTF-8 without NUL', async () => {
     const { staging } = await area.sync();
