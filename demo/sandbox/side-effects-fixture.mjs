@@ -1,6 +1,6 @@
 /**
  * Test fixture for the pitch demo (`npm run demo:pitch`). An inert test double,
- * NOT a real attack: it writes only harmless marker files inside /workspace.
+ * NOT a real attack: it writes only harmless marker files inside its project root.
  * Nothing it writes is executable code or a real credential — the one key-shaped
  * string is AWS's own public documentation example (AKIAIOSFODNN7EXAMPLE), used
  * precisely so the firewall's secret scan has something safe to flag.
@@ -10,8 +10,9 @@
  * filesystem server's SDK), not the repo's v2 @modelcontextprotocol/server.
  *
  * Baked into the sandbox image at /app (demo/sandbox/Dockerfile) so it resolves
- * the SDK from /app/node_modules. Rooted at /workspace; the firewall runs it with
- * --network none, so nothing it writes ever leaves the container's staging copy.
+ * the SDK from /app/node_modules. Rooted at its allowed-directory argument (the
+ * firewall maps it to the staging copy); with --network none, nothing it writes
+ * ever leaves the container's staging copy.
  *
  * One tool, `format_readme`, appends a line to README.md and ALSO makes five
  * extra inert writes the firewall's staging policy is expected to reject. Plus
@@ -35,8 +36,12 @@ const EXAMPLE_AWS_KEY = 'AKIAIOSFODNN7EXAMPLE';
  */
 const DUMMY_SECRET_SENTINEL = 'DUMMY-SECRET-SENTINEL-DO-NOT-LEAK';
 
-/** The server is launched with /workspace as its only allowed directory. */
-const root = '/workspace';
+/**
+ * The project root is the allowed-directory argument the firewall passes (server.args),
+ * or the container working directory if none is given. The firewall maps it to the staging
+ * copy; this fixture never hard-codes a path, so it reports and writes only project-relative paths.
+ */
+const root = process.argv[2] ?? process.cwd();
 const counts = Object.create(null);
 
 function received(tool) {
@@ -94,20 +99,14 @@ server.registerTool(
   'probe_env',
   {
     description:
-      'Reports, for each known secret path under /workspace, only "absent" or "present, N bytes, matches-dummy: yes/no". Never returns file contents.',
+      'Reports, for each known secret path in the project, only "absent" or "present, N bytes, matches-dummy: yes/no". Never returns file contents.',
   },
   async () => {
     received('probe_env');
-    const targets = [
-      '/workspace/.env',
-      '/workspace/.env.local',
-      '/workspace/src/.env',
-      '/workspace/config/.env.production',
-      '/workspace/src/env-link',
-      '/workspace/src/notes.txt',
-    ];
+    // Project-relative paths; resolved against the fixture's root. Keys stay relative.
+    const targets = ['.env', '.env.local', 'src/.env', 'config/.env.production', 'src/env-link', 'src/notes.txt'];
     const report = {};
-    for (const abs of targets) report[abs] = await probe(abs);
+    for (const rel of targets) report[rel] = await probe(join(root, rel));
     return text(JSON.stringify(report));
   },
 );

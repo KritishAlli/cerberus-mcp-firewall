@@ -16,7 +16,7 @@
  *   - ALLOWed and a dummy value leaked: FAIL (non-zero exit).
  *
  * Then it runs the fixture's `probe_env` inside the container to see, from the
- * server's side, which of those files staging actually materialized in /workspace.
+ * server's side, which of those files staging actually materialized in the sandbox.
  *
  * Usage: npm run demo:env [-- --keep] [-- --monitor-port N]
  *
@@ -43,6 +43,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { stringify as stringifyYaml } from 'yaml';
 import type { CallToolResult } from '@modelcontextprotocol/server';
 import { loadConfig } from '../src/config/load.js';
+import { useRealProjectPaths } from './demo-config.js';
 import { FIREWALL_META_KEY } from '../src/proxy/interceptor.js';
 import type { RuleId } from '../src/shared/contracts.js';
 
@@ -236,7 +237,7 @@ async function makeTempProject(): Promise<SetupResult> {
 
 function writeTempConfig(templateFile: string, outFile: string, project: string, monitorPort: number): void {
   const config = loadConfig(resolve(repoRoot, templateFile));
-  config.server.sandbox!.project = project;
+  useRealProjectPaths(config, project);
   config.monitor.port = monitorPort;
   writeFileSync(outFile, stringifyYaml(config));
 }
@@ -253,35 +254,38 @@ interface Vector {
   secretTarget: boolean;
 }
 
-const VECTORS: Vector[] = [
-  // 1. read_text_file on the root .env in many spellings.
-  { label: 'read .env', tool: 'read_text_file', args: { path: '.env' }, secretTarget: true },
-  { label: 'read ./.env', tool: 'read_text_file', args: { path: './.env' }, secretTarget: true },
-  { label: 'read /workspace/.env', tool: 'read_text_file', args: { path: '/workspace/.env' }, secretTarget: true },
-  { label: 'read src/../.env', tool: 'read_text_file', args: { path: 'src/../.env' }, secretTarget: true },
-  { label: 'read .ENV (case)', tool: 'read_text_file', args: { path: '.ENV' }, secretTarget: true },
-  { label: 'read .env/ (trailing slash)', tool: 'read_text_file', args: { path: '.env/' }, secretTarget: true },
-  { label: 'read %2e%2e/.env (encoded)', tool: 'read_text_file', args: { path: '%2e%2e/.env' }, secretTarget: true },
-  { label: 'read file:///workspace/.env', tool: 'read_text_file', args: { path: 'file:///workspace/.env' }, secretTarget: true },
-  // 2. other dotenv files.
-  { label: 'read .env.local', tool: 'read_text_file', args: { path: '.env.local' }, secretTarget: true },
-  { label: 'read src/.env', tool: 'read_text_file', args: { path: 'src/.env' }, secretTarget: true },
-  { label: 'read config/.env.production', tool: 'read_text_file', args: { path: 'config/.env.production' }, secretTarget: true },
-  // 3. the symlink and the hardlink.
-  { label: 'read src/env-link (symlink)', tool: 'read_text_file', args: { path: 'src/env-link' }, secretTarget: true },
-  { label: 'read src/notes.txt (hardlink)', tool: 'read_text_file', args: { path: 'src/notes.txt' }, secretTarget: true },
-  // 4. multi-file read mixing a safe file with .env.
-  { label: 'read_multiple [greet.js, .env]', tool: 'read_multiple_files', args: { paths: ['src/greet.js', '.env'] }, secretTarget: true },
-  // 5. other tools pointed at .env.
-  { label: 'get_file_info .env', tool: 'get_file_info', args: { path: '.env' }, secretTarget: true },
-  { label: 'read_media_file .env', tool: 'read_media_file', args: { path: '.env' }, secretTarget: true },
-  { label: 'move_file .env -> src/moved.txt', tool: 'move_file', args: { source: '.env', destination: 'src/moved.txt' }, secretTarget: true },
-  { label: 'write_file .env', tool: 'write_file', args: { path: '.env', content: 'overwritten by suite\n' }, secretTarget: true },
-  // 6. discovery tools that must not surface a .env.
-  { label: 'search_files ".env"', tool: 'search_files', args: { path: '.', pattern: '.env' }, secretTarget: false },
-  { label: 'directory_tree /', tool: 'directory_tree', args: { path: '.' }, secretTarget: false },
-  { label: 'list_directory /', tool: 'list_directory', args: { path: '.' }, secretTarget: false },
-];
+/** Vectors use the project's real paths (relative and absolute); no "/workspace" anywhere. */
+function buildVectors(project: string): Vector[] {
+  return [
+    // 1. read_text_file on the root .env in many spellings (relative, absolute, traversal, case, encoded, file://).
+    { label: 'read .env', tool: 'read_text_file', args: { path: '.env' }, secretTarget: true },
+    { label: 'read ./.env', tool: 'read_text_file', args: { path: './.env' }, secretTarget: true },
+    { label: 'read <project>/.env (absolute)', tool: 'read_text_file', args: { path: `${project}/.env` }, secretTarget: true },
+    { label: 'read src/../.env', tool: 'read_text_file', args: { path: 'src/../.env' }, secretTarget: true },
+    { label: 'read .ENV (case)', tool: 'read_text_file', args: { path: '.ENV' }, secretTarget: true },
+    { label: 'read .env/ (trailing slash)', tool: 'read_text_file', args: { path: '.env/' }, secretTarget: true },
+    { label: 'read %2e%2e/.env (encoded)', tool: 'read_text_file', args: { path: '%2e%2e/.env' }, secretTarget: true },
+    { label: 'read file://<project>/.env', tool: 'read_text_file', args: { path: `file://${project}/.env` }, secretTarget: true },
+    // 2. other dotenv files.
+    { label: 'read .env.local', tool: 'read_text_file', args: { path: '.env.local' }, secretTarget: true },
+    { label: 'read src/.env', tool: 'read_text_file', args: { path: 'src/.env' }, secretTarget: true },
+    { label: 'read config/.env.production', tool: 'read_text_file', args: { path: 'config/.env.production' }, secretTarget: true },
+    // 3. the symlink and the hardlink.
+    { label: 'read src/env-link (symlink)', tool: 'read_text_file', args: { path: 'src/env-link' }, secretTarget: true },
+    { label: 'read src/notes.txt (hardlink)', tool: 'read_text_file', args: { path: 'src/notes.txt' }, secretTarget: true },
+    // 4. multi-file read mixing a safe file with .env.
+    { label: 'read_multiple [greet.js, .env]', tool: 'read_multiple_files', args: { paths: ['src/greet.js', '.env'] }, secretTarget: true },
+    // 5. other tools pointed at .env.
+    { label: 'get_file_info .env', tool: 'get_file_info', args: { path: '.env' }, secretTarget: true },
+    { label: 'read_media_file .env', tool: 'read_media_file', args: { path: '.env' }, secretTarget: true },
+    { label: 'move_file .env -> src/moved.txt', tool: 'move_file', args: { source: '.env', destination: 'src/moved.txt' }, secretTarget: true },
+    { label: 'write_file .env', tool: 'write_file', args: { path: '.env', content: 'overwritten by suite\n' }, secretTarget: true },
+    // 6. discovery tools that must not surface a .env.
+    { label: 'search_files ".env"', tool: 'search_files', args: { path: '.', pattern: '.env' }, secretTarget: false },
+    { label: 'directory_tree (root)', tool: 'directory_tree', args: { path: '.' }, secretTarget: false },
+    { label: 'list_directory (root)', tool: 'list_directory', args: { path: '.' }, secretTarget: false },
+  ];
+}
 
 interface Row {
   label: string;
@@ -294,9 +298,9 @@ interface Row {
   listedEnv?: boolean;
 }
 
-async function runVectors(gateway: Gateway): Promise<Row[]> {
+async function runVectors(gateway: Gateway, vectors: Vector[]): Promise<Row[]> {
   const rows: Row[] = [];
-  for (const v of VECTORS) {
+  for (const v of vectors) {
     let row: Row;
     try {
       const { result, text } = await gateway.call(v.tool, v.args);
@@ -433,7 +437,7 @@ async function main(): Promise<void> {
   try {
     // Phase A: the fs gateway, all vectors.
     gateway = await Gateway.start(fsConfigFile, monitorUrl);
-    rows = await runVectors(gateway);
+    rows = await runVectors(gateway, buildVectors(project));
     const monitorRawFs = await readMonitorRaw(monitorUrl);
     if (leaks(monitorRawFs)) problems.push('a dummy value appeared in the fs-gateway monitor stream');
     if (leaks(gateway.stderr)) problems.push('a dummy value appeared in the fs-gateway stderr');
@@ -477,7 +481,7 @@ async function main(): Promise<void> {
   if (!hardlinkMade) {
     out(`   ${hardlinkNote}`);
   } else {
-    const notesProbe = probe['/workspace/src/notes.txt'] ?? '(not probed)';
+    const notesProbe = probe['src/notes.txt'] ?? '(not probed)';
     const notesRow = rows.find((r) => r.label.includes('notes.txt'));
     const copied = notesProbe.startsWith('present') && notesProbe.includes('matches-dummy: yes');
     out(`   probe_env says: ${notesProbe}`);

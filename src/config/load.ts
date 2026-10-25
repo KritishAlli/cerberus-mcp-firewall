@@ -84,6 +84,7 @@ export function toUpstreamLaunch(server: DownstreamServerConfig, workspaceDir?: 
     command: server.command,
     args: server.args,
     workspaceDir,
+    ...(sandbox.workspaceMount === undefined ? {} : { workspaceMount: sandbox.workspaceMount }),
     ...(sandbox.serverDir === undefined ? {} : { serverDir: sandbox.serverDir }),
     ...(sandbox.env === undefined ? {} : { env: sandbox.env }),
     user: sandbox.user ?? hostUser(),

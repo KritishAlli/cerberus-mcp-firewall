@@ -14,7 +14,7 @@ server:
   id: tool                       # canonical tool names are "tool/<tool>"
   # Inside the container: the fixture baked into the image, allowed only /workspace.
   command: node
-  args: ["/app/side-effects-fixture.mjs"]
+  args: ["/app/side-effects-fixture.mjs", "/workspace"]   # 2nd arg = the fixture's project root (demos repoint it)
   timeoutMs: 10000
   sandbox:
     image: mcp-firewall-sandbox:dev   # built from demo/sandbox/Dockerfile; never pulled

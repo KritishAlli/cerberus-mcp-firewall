@@ -25,7 +25,30 @@
  *   - DownstreamServer gains an optional `sandbox` section (SandboxConfig).
  *     src/config/load.ts maps it onto UpstreamLaunch (src/proxy/upstream.ts).
  */
+import { posix as pathPosix } from 'node:path';
 import { z } from 'zod';
+
+/**
+ * Container path the staging copy is bind-mounted at and the server's working directory.
+ * Default "/workspace" (an internal detail). A config may set it to the project's own real
+ * path so nothing the user or the server sees mentions "/workspace". Must be an absolute,
+ * normalized posix path with no "..", not "/", and not a system location the container needs.
+ */
+const SYSTEM_MOUNT_TARGETS: readonly string[] = ['/bin', '/etc', '/proc', '/sys', '/dev', '/usr', '/tmp', '/server', '/app', '/root'];
+export const WorkspaceMountSchema = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine((p) => p.startsWith('/'), 'workspaceMount must be an absolute path')
+  .refine((p) => !/[\u0000,\n\r]/.test(p), 'workspaceMount must not contain NUL, commas or newlines')
+  .refine((p) => pathPosix.normalize(p) === p, 'workspaceMount must be a normalized path')
+  .refine((p) => !p.endsWith('/'), 'workspaceMount must not end with "/"')
+  .refine((p) => !p.split('/').includes('..'), 'workspaceMount must not contain ".."')
+  .refine((p) => p !== '/', 'workspaceMount must not be the container root "/"')
+  .refine(
+    (p) => !SYSTEM_MOUNT_TARGETS.some((s) => p === s || p.startsWith(`${s}/`)),
+    'workspaceMount must not be a system path (/bin, /etc, /proc, /sys, /dev, /usr, /tmp, /server, /app, /root)',
+  );
 
 // ---------------------------------------------------------------------------
 // Limits (contract invariant: strings and values are length-limited)
@@ -294,6 +317,12 @@ export const SandboxConfigSchema = z.strictObject({
   project: z.string().min(1),
   /** Server code mounted read-only at /server (relative to the config file). Omit if the image holds it. */
   serverDir: z.string().min(1).optional(),
+  /**
+   * Container path the staging copy is mounted at and the working directory (default "/workspace").
+   * Set it to the project's own real path (and point server.args and policy.allowedRoots at the same
+   * path) so the server and the user only ever see real project paths. Backward compatible: omit for "/workspace".
+   */
+  workspaceMount: WorkspaceMountSchema.optional(),
   /** The only environment the container gets. Nothing from the host is passed through. */
   env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'env names must be [A-Za-z_][A-Za-z0-9_]*'), z.string()).optional(),
   /** "uid:gid" inside the container. Default: the host uid:gid. Root (uid 0) is refused. */

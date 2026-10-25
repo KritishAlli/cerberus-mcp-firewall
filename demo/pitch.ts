@@ -48,6 +48,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { stringify as stringifyYaml } from 'yaml';
 import type { CallToolResult } from '@modelcontextprotocol/server';
 import { loadConfig } from '../src/config/load.js';
+import { useRealProjectPaths } from './demo-config.js';
 import { BLOCKED_PREFIX, FIREWALL_META_KEY } from '../src/proxy/interceptor.js';
 import { STAGED_META_KEY } from '../src/proxy/staged-call.js';
 import { FirewallEventSchema, type FirewallEvent, type RuleId } from '../src/shared/contracts.js';
@@ -299,10 +300,10 @@ async function makeTempProject(): Promise<string> {
   return project;
 }
 
-/** Load a pitch config, repoint it at the temp project and chosen port, write a temp copy. */
+/** Load a pitch config, repoint it at the temp project (real paths, not /workspace) and chosen port. */
 function writeTempConfig(templateFile: string, outFile: string, project: string, monitorPort: number): void {
   const config = loadConfig(resolve(repoRoot, templateFile));
-  config.server.sandbox!.project = project;
+  useRealProjectPaths(config, project);
   config.monitor.port = monitorPort;
   writeFileSync(outFile, stringifyYaml(config));
 }
@@ -355,8 +356,11 @@ const POSTINSTALL_PACKAGE_JSON = `${JSON.stringify(
 
 async function act1(gateway: Gateway, project: string): Promise<void> {
   banner('ACT 1 — a legitimate edit is allowed and lands in the project');
-  out('   fs/write_file /workspace/src/greet.js  (adds a farewell function)');
-  const res = await gateway.call('write_file', { path: '/workspace/src/greet.js', content: GREET_WITH_FAREWELL });
+  // Relative real path (Cerberus maps it to the staging copy internally). A write arg is
+  // scanned for secrets, and a random temp dir's name is itself high-entropy, so use the
+  // relative form here; the absolute form is exercised on the Act 2 read, which isn't scanned.
+  out('   fs/write_file src/greet.js  (adds a farewell function)');
+  const res = await gateway.call('write_file', { path: 'src/greet.js', content: GREET_WITH_FAREWELL });
   out(`   → ${res.isError ? 'rejected' : 'ok'}: ${oneLine(res.text)}`);
   check(!res.isError, 'edit is ALLOWed (content-scanning fix: a plain source edit is not PATH_NOT_ALLOWED)');
   check(res.staged?.applied === 1 && res.staged.rejected === 0, 'exactly one change applied, none rejected');
@@ -368,8 +372,10 @@ async function act2(gateway: Gateway, project: string): Promise<void> {
   banner('ACT 2 — same gateway, acting as a prompt-injected agent: both calls blocked');
   const before = readFileSync(join(project, 'package.json'), 'utf8');
 
-  out('   fs/read_text_file /workspace/.env  (attempt to exfiltrate a secret)');
-  const read = await gateway.call('read_text_file', { path: '/workspace/.env' });
+  // Absolute real path — Cerberus maps it to the staging copy internally (reads aren't secret-scanned).
+  const envPath = join(project, '.env');
+  out(`   fs/read_text_file ${envPath}  (attempt to exfiltrate a secret)`);
+  const read = await gateway.call('read_text_file', { path: envPath });
   out(`   → ${read.isError ? 'blocked' : 'ok'}: ${oneLine(read.text)}`);
   const readBlocked = read.decision?.decision === 'DENY' && read.text.startsWith(BLOCKED_PREFIX);
   check(readBlocked, '.env read is BLOCKED before the downstream sees it (decision=DENY)');
@@ -377,8 +383,8 @@ async function act2(gateway: Gateway, project: string): Promise<void> {
   const envValue = readFileSync(join(project, '.env'), 'utf8').match(/^DEMO_API_KEY=(.*)$/m)?.[1] ?? '';
   check(envValue.length > 0 && !read.text.includes(envValue), ".env value never appears in the firewall output");
 
-  out('   fs/write_file /workspace/package.json  (attempt to add a postinstall script)');
-  const write = await gateway.call('write_file', { path: '/workspace/package.json', content: POSTINSTALL_PACKAGE_JSON });
+  out('   fs/write_file package.json  (attempt to add a postinstall script)');
+  const write = await gateway.call('write_file', { path: 'package.json', content: POSTINSTALL_PACKAGE_JSON });
   out(`   → ${write.isError ? 'blocked' : 'ok'}: ${oneLine(write.text)}`);
   const writeBlocked = write.decision?.decision === 'DENY' && write.text.startsWith(BLOCKED_PREFIX);
   check(writeBlocked, 'package.json write is BLOCKED before the downstream sees it (decision=DENY)');
