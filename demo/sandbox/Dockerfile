@@ -16,6 +16,11 @@ COPY package.json package-lock.json ./
 # Exact versions and integrity hashes from the lockfile; no package runs install scripts.
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
+# Inert test double for the pitch demo (npm run demo:pitch). Resolves the SDK
+# from /app/node_modules. The firewall runs it explicitly via server.args; it is
+# never the default downstream. Nothing it writes is code or a real credential.
+COPY side-effects-fixture.mjs /app/side-effects-fixture.mjs
+
 # The firewall overrides this with the host uid:gid; never root either way.
 USER node
 WORKDIR /workspace

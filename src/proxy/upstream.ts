@@ -34,7 +34,7 @@ import { Client } from '@modelcontextprotocol/client';
 import { getDefaultEnvironment, StdioClientTransport, type StdioServerParameters } from '@modelcontextprotocol/client/stdio';
 import type { CallToolResult, Tool } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import type { DownstreamServerConfig } from '../shared/contracts.js';
+import { WorkspaceMountSchema, type DownstreamServerConfig } from '../shared/contracts.js';
 import { isProcessAlive } from './staging.js';
 
 /** Cap on tools/list pages, against a server whose nextCursor never converges. */
@@ -105,7 +105,8 @@ export const LocalLaunchSchema = z.strictObject({
 /**
  * Run the server in a Docker container: `--network none --read-only --cap-drop ALL
  * --security-opt no-new-privileges`, tmpfs /tmp, workspaceDir mounted rw at
- * /workspace (the working directory) and serverDir mounted ro at /server.
+ * `workspaceMount` (default /workspace; also the working directory) and serverDir
+ * mounted ro at /server.
  */
 export const DockerLaunchSchema = z.strictObject({
   mode: z.literal('docker'),
@@ -119,8 +120,10 @@ export const DockerLaunchSchema = z.strictObject({
   command: z.string().min(1),
   /** Arguments to the command inside the container, e.g. ["/server/index.mjs"]. */
   args: z.array(z.string()).default([]),
-  /** Host dir mounted read-write at /workspace: the staging copy, never the real project. Must exist. */
+  /** Host dir mounted read-write at `workspaceMount`: the staging copy, never the real project. Must exist. */
   workspaceDir: MountPathSchema,
+  /** Container path the staging dir is mounted at and the working directory. Default "/workspace". */
+  workspaceMount: WorkspaceMountSchema.default('/workspace'),
   /** Host dir with the server code, mounted read-only at /server. Must exist. */
   serverDir: MountPathSchema.optional(),
   /** Explicit variables set in the container with `-e KEY=VALUE`. */
@@ -210,6 +213,7 @@ export function buildDockerArgs(
   const ownerPid = options.ownerPid ?? process.pid;
   if (!Number.isInteger(ownerPid) || ownerPid < 1) throw new LaunchConfigError('invalid owner pid');
   const workspace = mountSource(l.workspaceDir, 'workspaceDir');
+  const mountTarget = l.workspaceMount ?? '/workspace';
   const memory = l.memory ?? '512m';
 
   // [flag, value] pairs before the image. Every value is checked not to look like a flag.
@@ -224,7 +228,7 @@ export function buildDockerArgs(
     // Equal to --memory: no swap on top of the limit (Docker's default allows as much again).
     ['--memory-swap', memory],
     ['--tmpfs', '/tmp:rw,noexec,nosuid,size=64m'],
-    ['--mount', `type=bind,src=${workspace},dst=/workspace`],
+    ['--mount', `type=bind,src=${workspace},dst=${mountTarget}`],
   ];
   if (l.serverDir !== undefined) {
     flags.push(['--mount', `type=bind,src=${mountSource(l.serverDir, 'serverDir')},dst=/server,readonly`]);
@@ -235,7 +239,7 @@ export function buildDockerArgs(
     ['--label', `${CONTAINER_LABELS.pid}=${ownerPid}`],
     ['--label', `${CONTAINER_LABELS.host}=${labelHost(options.host)}`],
     ['--label', `${CONTAINER_LABELS.staging}=${workspace}`],
-    ['-w', '/workspace'],
+    ['-w', mountTarget],
   );
 
   for (const [, value] of flags) {

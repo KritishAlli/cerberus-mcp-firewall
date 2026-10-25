@@ -21,7 +21,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, type Stats } from 'node:fs';
 import {
-  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -42,8 +41,12 @@ import path from 'node:path';
 import type { ChangeDecision, FileChange, RuleId } from '../shared/contracts.js';
 import { pathMatches } from '../security/normalize.js';
 
-/** Never copied into staging, never reported by diff, never applied. */
-export const DEFAULT_EXCLUDES: readonly string[] = ['.git/', 'node_modules/', '.env', '.env.*'];
+/**
+ * Never copied into staging, never reported by diff, never applied. `.claude/` is
+ * excluded for the same reason as `.git/`: it holds the agent's own config (permission
+ * rules, hooks), which the sandboxed downstream server has no business reading or changing.
+ */
+export const DEFAULT_EXCLUDES: readonly string[] = ['.git/', 'node_modules/', '.env', '.env.*', '.claude/'];
 
 const HASH_CHUNK_BYTES = 64 * 1024;
 /** Escaped paths listed in sync()'s warning about unmirrored project files. */
@@ -371,7 +374,10 @@ async function describe(abs: string, st: Stats): Promise<ManifestEntry> {
   if (st.isSymbolicLink()) return { type: 'symlink', size: st.size, mode, linkTarget: await readlink(abs) };
   if (st.isDirectory()) return { type: 'dir', size: 0, mode };
   if (st.isFile()) {
-    return { type: st.nlink > 1 ? 'special' : 'file', size: st.size, mode, sha256: await hashFile(abs, st) };
+    // Only a plain regular file (nlink === 1) is mirrored and hashed. A hardlinked
+    // file is 'special': never copied into staging, so a write through it in the
+    // project (which would silently change every other link, e.g. a .env) is impossible.
+    return st.nlink > 1 ? { type: 'special', size: st.size, mode } : { type: 'file', size: st.size, mode, sha256: await hashFile(abs, st) };
   }
   return { type: 'special', size: st.size, mode };
 }
@@ -455,6 +461,47 @@ async function readVerified(abs: string, entry: ManifestEntry): Promise<Buffer> 
       throw new StagingError('staged file changed after it was scanned');
     }
     return content;
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Copies a plain regular file into staging, race-safely. `dst` must already be
+ * removed (caller does so, so O_EXCL can't write through something swapped in).
+ * The source is opened with O_NOFOLLOW and the open fd is fstat'd: the bytes are
+ * copied only if it is still a regular file with nlink === 1 and the same dev/ino
+ * as the pre-open lstat. Anything else — a symlink or hardlink swapped in, the
+ * file gaining a second link, or it vanishing — means it is not mirrored this
+ * sync, and the function simply returns, leaving no staging entry.
+ */
+async function copyRegularFile(src: string, dst: string, mode: number): Promise<void> {
+  const before = await lstatIfPresent(src);
+  if (before === undefined || !before.isFile() || before.nlink !== 1) return;
+  let handle: FileHandle;
+  try {
+    handle = await open(src, SAFE_READ_FLAGS);
+  } catch (err) {
+    // A symlink (ELOOP) or a now-missing file (ENOENT) swapped in since the lstat: not mirrored.
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ELOOP' || code === 'ENOENT') return;
+    throw err;
+  }
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino) return;
+    const out = await open(dst, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, mode);
+    try {
+      const buffer = Buffer.alloc(HASH_CHUNK_BYTES);
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+        if (bytesRead === 0) break;
+        await out.write(buffer, 0, bytesRead);
+      }
+      await out.chmod(mode);
+    } finally {
+      await out.close();
+    }
   } finally {
     await handle.close();
   }
@@ -629,6 +676,10 @@ export class StagingArea {
   private excludedRoots: string[] = [];
   /** Entries with unsafe names the last diff() found, by escaped display path. */
   private lastUnsafe = new Map<string, UnsafeEntry>();
+  /** Project paths the last sync() did not mirror because they are not plain regular files
+   *  (hardlinks, devices, …). A server write at such a path is forced to DENY: applying it
+   *  would write through to the project, replacing the hardlink/node there. */
+  private notMirrored = new Set<string>();
 
   constructor(
     readonly projectRoot: string,
@@ -656,6 +707,9 @@ export class StagingArea {
         `[firewall] staging: ${skipped.length} project file(s) with unsafe names are not mirrored into staging: ${listed}${more}`,
       );
     }
+    // Hardlinked / special project files are scanned but not mirrored; remember them so a
+    // server write landing at one of their paths is forced to DENY (never applied).
+    this.notMirrored = new Set([...project].filter(([, e]) => e.type === 'special').map(([rel]) => rel));
     await this.pruneStaging('', project);
     const current = await scan(this.stagingRoot, this.rules);
     for (const [rel, entry] of project) {
@@ -831,6 +885,7 @@ export class StagingArea {
   forcedDenyReason(relPath: string): string | undefined {
     if (this.lastUnsafe.has(relPath)) return 'file name cannot be handled safely';
     if (isExcludedPath(this.rules, relPath)) return 'path is excluded from staging';
+    if (this.notMirrored.has(relPath)) return 'path is not mirrored into staging';
     return undefined;
   }
 
@@ -946,6 +1001,9 @@ export class StagingArea {
     }
     const expected = projectAtSync.get(rel);
     const current = await describeIfPresent(abs);
+    // Defense in depth: a hardlinked / special file (at sync or right now) is never written
+    // through — a rename over it would silently change every other link (e.g. a .env).
+    if (expected?.type === 'special' || current?.type === 'special') return 'WRITE_NOT_ALLOWED';
     // Directories have no content to conflict on; pruneEmptyProjectDirs may have removed an empty one.
     if (expected?.type === 'dir' && (current === undefined || current.type === 'dir')) return undefined;
     return sameEntry(expected, current) ? undefined : 'WRITE_CONFLICT';
@@ -1041,15 +1099,9 @@ export class StagingArea {
     await rm(dst, { recursive: true, force: true });
     if (entry.type === 'symlink') {
       await symlink(entry.linkTarget!, dst);
-    } else if (entry.sha256 !== undefined) {
-      // COPYFILE_EXCL: if something reappears at dst after the rm, fail rather than write through it.
-      await copyFile(src, dst, constants.COPYFILE_EXCL);
-      const handle = await open(dst, SAFE_READ_FLAGS);
-      try {
-        await handle.chmod(entry.mode);
-      } finally {
-        await handle.close();
-      }
+    } else if (entry.type === 'file') {
+      // 'special' entries (hardlinks, devices, sockets, fifos) are never mirrored.
+      await copyRegularFile(src, dst, entry.mode);
     }
   }
 
@@ -1060,12 +1112,9 @@ export class StagingArea {
     const entry = await describeIfPresent(src);
     if (entry === undefined) return;
     await this.copyToStaging(rel, entry);
-    // Hardlinked project files arrive as plain files; devices and the like are not copied.
-    if (entry.type === 'special') {
-      if (entry.sha256 !== undefined) restored.set(rel, { ...entry, type: 'file' });
-    } else {
-      restored.set(rel, entry);
-    }
+    // 'special' entries (hardlinks, devices, …) are not mirrored, so copyToStaging left
+    // nothing at dst and the baseline records nothing for this path.
+    if (entry.type !== 'special') restored.set(rel, entry);
     if (entry.type !== 'dir') return;
     for (const raw of await readNames(src)) {
       const { name, safe } = entryName(raw, false);

@@ -1,0 +1,82 @@
+# MCP Firewall config, PITCH DEMO — filesystem acts (`npm run demo:pitch`,
+# Acts 1-2). A verbatim copy of config/sandbox.yaml. demo/pitch.ts loads this,
+# repoints server.sandbox.project at a throwaway temp copy of demo/project, and
+# runs the firewall on that; demo/project itself is never touched.
+#
+# Validated by src/config/load.ts like firewall.yaml; an invalid file stops startup.
+#
+# The real filesystem server runs in Docker against a staging copy of
+# demo/project. Approved changes are copied back; nothing else from the host
+# is visible to it. Needs Docker and the image:
+#   npm run sandbox:build
+#
+# Policy semantics: Winston (staging rules below are a starting point until
+# evaluateFileChanges lands). Loader + documentation: Kritish.
+# DEMO ONLY: dummy secrets in demo/project. Never point this at real credentials.
+
+server:
+  id: fs                         # canonical tool names are "fs/<tool>"
+  # Inside the container: the pinned server baked into the image, allowed only /workspace.
+  command: node
+  args: ["/app/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "/workspace"]
+  timeoutMs: 10000
+  sandbox:
+    image: mcp-firewall-sandbox:dev   # built from demo/sandbox/Dockerfile; never pulled
+    project: ../demo/project          # relative to this file
+    # memory 512m, pidsLimit 128, user = host uid:gid (defaults)
+
+monitor:
+  enabled: true
+  host: 127.0.0.1
+  port: 3000
+  maxEvents: 100
+
+policy:
+  defaultDecision: DENY
+
+  protectedPaths:
+    - "**/.env"
+
+  # Filesystem-server paths may be relative to /workspace or absolute there.
+  allowedRoots: [".", "/workspace"]
+  # Docker has no network in sandbox mode, so no outbound host is allowed.
+  allowedHosts: []
+
+  # Every tool of @modelcontextprotocol/server-filesystem 2026.8.31. Writes are
+  # allowed through to the sandbox; what lands in the project is decided by `staging`.
+  approvedTools:
+    - fs/read_file
+    - fs/read_text_file
+    - fs/read_media_file
+    - fs/read_multiple_files
+    - fs/write_file
+    - fs/edit_file
+    - fs/create_directory
+    - fs/list_directory
+    - fs/list_directory_with_sizes
+    - fs/directory_tree
+    - fs/move_file
+    - fs/search_files
+    - fs/get_file_info
+    - fs/list_allowed_directories
+
+  pathArgs: [path, paths, source, destination]
+  writeTools:
+    - fs/write_file
+    - fs/edit_file
+    - fs/create_directory
+    - fs/move_file
+
+  staging:
+    writablePaths:
+      - "src/**"
+      - "README.md"
+    # Persistence locations: never written, even if writablePaths grows to cover them.
+    protectedWritePaths:
+      - ".git/**"
+      - ".husky/**"
+      - ".github/workflows/**"
+      - ".vscode/**"
+      - "package.json"           # npm lifecycle scripts run on install
+    maxFileBytes: 65536
+    maxChangesPerCall: 20

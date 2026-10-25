@@ -109,6 +109,25 @@ describe('upstream / buildDockerArgs', () => {
     expect(args).not.toContain('-e');
   });
 
+  it('defaults the mount target and workdir to /workspace', () => {
+    const args = buildDockerArgs(launch(), { containerName: NAME });
+    expect(args).toContain(`type=bind,src=${workspace},dst=/workspace`);
+    expect(args[args.indexOf('-w') + 1]).toBe('/workspace');
+  });
+
+  it('uses an explicit workspaceMount as the bind-mount target and the workdir', () => {
+    const target = '/Users/demo/cerberus-demo/project';
+    const args = buildDockerArgs(launch({ workspaceMount: target }), { containerName: NAME });
+    expect(args).toContain(`type=bind,src=${workspace},dst=${target}`);
+    expect(args[args.indexOf('-w') + 1]).toBe(target);
+    // The staging label still records the host source dir, not the container target.
+    expect(args).toContain(`mcp-firewall.staging=${workspace}`);
+    // Nothing else changed: still exactly one rw mount, and the container target is never /workspace.
+    expect(args.filter((a) => a === '--mount')).toHaveLength(1);
+    expect(args).not.toContain(`type=bind,src=${workspace},dst=/workspace`);
+    expect(args).not.toContain('/workspace'); // as a standalone argv entry (e.g. -w)
+  });
+
   it('mounts the realpath of a symlinked directory', async () => {
     await symlink(workspace, join(tmp, 'link'));
     const args = buildDockerArgs(launch({ workspaceDir: join(tmp, 'link') }), { containerName: NAME });
@@ -151,6 +170,18 @@ describe('upstream / buildDockerArgs', () => {
       ['user that is a flag', () => ({ user: '--privileged' })],
       ['memory that is a flag', () => ({ memory: '--privileged' })],
       ['pidsLimit of 0', () => ({ pidsLimit: 0 })],
+      ['relative workspaceMount', () => ({ workspaceMount: 'project' })],
+      ['workspaceMount of "/"', () => ({ workspaceMount: '/' })],
+      ['workspaceMount with ".."', () => ({ workspaceMount: '/a/../b' })],
+      ['non-normalized workspaceMount', () => ({ workspaceMount: '/a//b' })],
+      ['workspaceMount with a trailing slash', () => ({ workspaceMount: '/project/' })],
+      ['workspaceMount with a comma', () => ({ workspaceMount: '/a,b' })],
+      ['workspaceMount = /etc', () => ({ workspaceMount: '/etc' })],
+      ['workspaceMount under /usr', () => ({ workspaceMount: '/usr/local/project' })],
+      ['workspaceMount = /server', () => ({ workspaceMount: '/server' })],
+      ['workspaceMount = /app', () => ({ workspaceMount: '/app' })],
+      ['workspaceMount = /tmp', () => ({ workspaceMount: '/tmp' })],
+      ['workspaceMount = /proc', () => ({ workspaceMount: '/proc' })],
       ['unknown key', () => ({ privileged: true }) as Partial<DockerLaunch>],
     ])('%s', (_name, extra) => {
       expect(() => buildDockerArgs(launch(extra()), { containerName: NAME })).toThrow(LaunchConfigError);
