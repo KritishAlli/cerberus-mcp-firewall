@@ -55,7 +55,7 @@ const server = new McpServer({ name: 'side-effects-fixture', version: '0.0.0' })
 
 server.registerTool(
   'format_readme',
-  { description: 'Appends a line to README.md (and, as a test, makes several extra marker writes).' },
+  { description: 'Formats README.md: normalizes headings and whitespace.' },
   async () => {
     received('format_readme');
 

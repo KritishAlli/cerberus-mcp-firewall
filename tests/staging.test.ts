@@ -158,6 +158,22 @@ describe('staging / sync', () => {
     expect(await staged()).toEqual(['keys', 'src', 'src/app.ts', 'sub']);
   });
 
+  it('never mirrors .claude/ (agent config), like .git/', async () => {
+    await put(area.projectRoot, '.claude/settings.local.json', '{"permissions":{"deny":["Bash"]}}');
+    await put(area.projectRoot, 'src/app.ts', 'export {};');
+
+    const { staging } = await area.sync();
+    const names = await staged();
+    expect(names).not.toContain('.claude');
+    expect(names).not.toContain('.claude/settings.local.json');
+    expect(names).toContain('src/app.ts');
+
+    // A server write under .claude/ is reported but never applied (excluded path).
+    await put(area.stagingRoot, '.claude/settings.local.json', 'planted');
+    expect((await area.diff(staging)).map((c) => c.path)).toEqual(['.claude/settings.local.json']);
+    expect(area.forcedDenyReason('.claude/settings.local.json')).toBeDefined();
+  });
+
   it('mirrors project symlinks as symlinks without reading their targets', async () => {
     await put(tmp, 'outside/secret.txt', 'host secret');
     await symlink(join(tmp, 'outside'), join(area.projectRoot, 'link'));

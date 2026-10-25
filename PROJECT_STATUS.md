@@ -170,6 +170,33 @@ probe_env (inside the container):
 - `src/env-link` (a symlink to `../.env`) was ALLOWed pre-call; it only failed to leak because the target is absent from staging. A symlink whose target *is* present would be read through.
 - The case variant (`.ENV`), trailing slash (`.env/`), `src/../.env` and `%2e%2e/.env` were all caught here as `PROTECTED_PATH` (the `**/.env` glob matched the normalized/suffix form), so the previously-noted case/traversal/trailing-slash gaps did **not** open a hole for the root `.env` in this run — but they remain worth hardening, since they rely on the glob rather than on path canonicalization.
 
+### Live demo inside Claude Code — `npm run demo:setup` / `demo:teardown` (2026-10-25)
+
+The live pitch now runs entirely in a Claude Code session (no browser monitor). `demo/pitch.ts` stays as the scripted, no-client **fallback**.
+
+`npm run demo:setup` (`demo/setup-claude.ts`):
+1. Copies `demo/project` to a fresh temp dir (`git init` + one commit); `demo/project` is never touched. Writes a `.gitignore` with `.claude/` and creates `.claude/` after the commit, so the local settings file is untracked (its `allow` rules then apply without the workspace-trust step) and `git status` stays clean.
+2. Writes two configs into the temp dir — `cerberus-fs.yaml` (copy of `config/pitch-fs.yaml`, serverId `fs`) and `cerberus-tool.yaml` (copy of `config/pitch-attack.yaml`, serverId `tool`), both repointed at the temp project with `monitor.enabled: false` (two gateways, no port 3000 fight).
+3. Registers both with Claude Code at **local scope**, run from the temp project, as `cerberus-fs` and `cerberus-tool`, using the exact absolute-path command `src/config/client-setup.ts` builds.
+4. Writes `.claude/settings.local.json` that **denies** the built-ins `Bash, Read, Edit, Write, MultiEdit, NotebookEdit, Glob, Grep, WebFetch, WebSearch` and **allows** `mcp__cerberus-fs__*` and `mcp__cerberus-tool__*` without prompting.
+5. Prints the one start line (`cd <temp project> && claude`) and the three demo prompts.
+
+`npm run demo:teardown` removes both registrations (`claude mcp remove --scope local`, from the temp project), sweeps orphaned containers, and deletes the temp dir and the state file. `demo:setup` runs teardown for any previous run first.
+
+**Two Cerberus instances on one project — verified, they behave.** `claude mcp list` from the temp project reported **both `✔ Connected`** (each gateway started its own container and staging mirror of the same project). A concurrent check (two MCP clients live at once) then ran an in-policy `cerberus-fs` `write_file` while calling `cerberus-tool` at the same time: the write was `applied: 1 / rejected: 0`, landed once in the temp project, the read-back saw it, the tool call succeeded, and both closed cleanly. Each instance has its own `mkdtemp` staging dir, its own container, and its own per-call conflict checks; `sweepStaleStagingDirs`/`sweepOrphanedContainers` only remove dirs/containers of **dead** firewalls, so one live instance never disturbs the other. No workaround was needed.
+
+**`.claude/` is not mirrored.** `.claude/` was added to `DEFAULT_EXCLUDES` in `src/proxy/staging.ts` (same rationale as `.git/`: it is the agent's own config). So the sandboxed server never sees `.claude/settings.local.json`, and a write there is reported + forced `DENY` + never applied, like any excluded path. New test in `tests/staging.test.ts` (297 unit tests pass).
+
+**Permission syntax (checked against Claude Code 2.1.310 and the official docs).** A bare built-in tool name in `deny` (e.g. `"Bash"`, `"WebFetch"`) removes that tool from Claude's context entirely; `mcp__<server>__*` in `allow` matches every tool of that server (hyphens are preserved). `settings.local.json` `deny` rules apply immediately; its `allow` rules apply without the trust step while the file is untracked (it is). The first launch in the new folder still shows the one-time **folder-trust** prompt — the presenter accepts it. `! git status` runs in the user's own shell (bash mode), which is **not** the Bash tool, so denying `Bash` does not block it.
+
+**What the presenter sees on a DENY (determined from code + a capability probe; confirm in the manual run):**
+- **The dialog shows.** Claude Code 2.1.310's `initialize` advertises `elicitation: { form: {}, url: {} }` (probed directly), so Cerberus's `supportsFormElicitation()` is true and every policy DENY and every rejected-changes batch pops Cerberus's **form dialog** (not the `/dev/tty` fallback). `CERBERUS_TTY_APPROVAL` is left unset.
+- **Block / Esc / no answer all keep the DENY.** From `client-approval.ts`: only `action === 'accept'` with `decision === 'allow_once'` approves; Block (the preselected, default choice), decline, cancel/Esc, and the 2-minute timeout all return `false`, so the DENY stands. Some denials (symlink, oversized, evaluator error, >12 changes) never offer the override.
+- **The reason is visible without expanding.** The dialog message itself names the action and reason in plain words (e.g. "Cerberus blocked read / Target: .env / Reason: This project path is protected by policy."), and for Act 3 it lists each rejected path **with its rule ID** (`PERSISTENCE_PATH`, `SECRET_DETECTED`, …). The literal `[MCP Firewall] BLOCKED (<RULE_ID>)` string and the `Cerberus sandbox blocked changes` note are in the tool *result*; whether Claude Code shows that inline or collapsed is a UI detail to confirm in the manual run — but the dialog guarantees the block and its reason are seen.
+- **Turning the dialog off:** there is **no** Cerberus toggle to suppress the dialog for a client that supports elicitation (that would be changing approval logic). The DENY is enforced regardless of the dialog, so a flaky dialog never lets a blocked call through; if the dialog misbehaves during the pitch, fall back to `npm run demo:pitch` (direct client, no dialog).
+
+**Verified without a human (2026-10-25):** both configs load under the unchanged loader; `demo:setup` registered both servers and `claude mcp list` showed both `✔ Connected`; the concurrent two-instance check passed; `demo:teardown` left no registrations (`~/.claude.json` has 0 `cerberus-*` entries), no temp dir, no labeled containers, and no `src/index.ts` processes. Regression: `npm run typecheck`, `npm test` (297), `npm run demo`, `npm run demo:pitch -- --auto`, `npm run demo:env` all pass. **Not yet done:** a human running the three prompts in an actual Claude Code session (the manual run this setup is for).
+
 ## Docker integration: verified (2026-10-24)
 
 - **Tests:** `tests/upstream-docker.test.ts` with Docker 29.9.2 and `node:22-slim`, integration tests included (36/36 now).

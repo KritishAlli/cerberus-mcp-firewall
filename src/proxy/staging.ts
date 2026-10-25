@@ -41,8 +41,12 @@ import path from 'node:path';
 import type { ChangeDecision, FileChange, RuleId } from '../shared/contracts.js';
 import { pathMatches } from '../security/normalize.js';
 
-/** Never copied into staging, never reported by diff, never applied. */
-export const DEFAULT_EXCLUDES: readonly string[] = ['.git/', 'node_modules/', '.env', '.env.*'];
+/**
+ * Never copied into staging, never reported by diff, never applied. `.claude/` is
+ * excluded for the same reason as `.git/`: it holds the agent's own config (permission
+ * rules, hooks), which the sandboxed downstream server has no business reading or changing.
+ */
+export const DEFAULT_EXCLUDES: readonly string[] = ['.git/', 'node_modules/', '.env', '.env.*', '.claude/'];
 
 const HASH_CHUNK_BYTES = 64 * 1024;
 /** Escaped paths listed in sync()'s warning about unmirrored project files. */
