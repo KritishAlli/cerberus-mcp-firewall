@@ -3,7 +3,7 @@
 > A local firewall for AI coding agents. It intercepts MCP tool calls, evaluates explicit security policies, runs the downstream server in a Docker sandbox against a staging copy of your project, applies only the file changes policy allows, and shows humans what happened in real time.
 
 Cal Hacks 13.0 · Aarav, Winston, Kritish · Design: [`docs/design.md`](docs/design.md) · Cerberus plan: [`docs/cerberus.md`](docs/cerberus.md)
-
+[YT Demo Link](https://youtu.be/nz0EQdcf4c8?si=HzAGP4mN79ZFzoOK)
 **Status: working prototype.** Implemented and tested:
 
 - MCP stdio gateway with policy enforcement: a denied call never reaches the downstream server.
